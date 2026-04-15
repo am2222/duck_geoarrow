@@ -47,9 +47,7 @@ def main() -> None:
     pt_col = arrow_tbl.column("pt").combine_chunks()
 
     # Canonical GeoArrow native Point is Struct<x:double, y:double>.
-    assert pt_col.type == pa.struct([("x", pa.float64()), ("y", pa.float64())]), (
-        f"unexpected type: {pt_col.type}"
-    )
+    assert pt_col.type == pa.struct([("x", pa.float64()), ("y", pa.float64())]), f"unexpected type: {pt_col.type}"
 
     # Stamp the geoarrow.point extension on the field (duckdb doesn't attach
     # Arrow extension metadata from a UDF return type).

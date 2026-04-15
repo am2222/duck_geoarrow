@@ -453,8 +453,8 @@ static void StAsGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector
 
 		if (extractor.geometry_type != GEOARROW_GEOMETRY_TYPE_POINT) {
 			GeoArrowWKBReaderReset(&wkb_reader);
-			throw InvalidInputException(
-			    "st_asgeoarrowpoint: expected POINT, got geometry type %d", extractor.geometry_type);
+			throw InvalidInputException("st_asgeoarrowpoint: expected POINT, got geometry type %d",
+			                            extractor.geometry_type);
 		}
 		if (extractor.xs.size() != 1) {
 			GeoArrowWKBReaderReset(&wkb_reader);
@@ -485,12 +485,12 @@ static list_entry_t AppendCoordBlock(Vector &coord_list, const double *xs, const
 		y_data[current + k] = ys[k];
 	}
 	ListVector::SetListSize(coord_list, new_size);
-	return list_entry_t{current, n};
+	return list_entry_t {current, n};
 }
 
 // Parse one WKB feature into `extractor`. Throws on parse error. Caller must reset reader.
-static void ParseWKBRow(GeoArrowWKBReader &reader, GeoArrowVisitor &visitor, GeoArrowError &err,
-                        string_t wkb, const char *fn_name) {
+static void ParseWKBRow(GeoArrowWKBReader &reader, GeoArrowVisitor &visitor, GeoArrowError &err, string_t wkb,
+                        const char *fn_name) {
 	GeoArrowBufferView buf;
 	buf.data = reinterpret_cast<const uint8_t *>(wkb.GetData());
 	buf.size_bytes = static_cast<int64_t>(wkb.GetSize());
@@ -526,13 +526,13 @@ static void WriteListOfListOfCoords(Vector &result, idx_t row, const CoordExtrac
 	for (idx_t r = 0; r < num_inner; r++) {
 		int32_t end = ext.ring_offsets[r];
 		int32_t n = end - prev;
-		auto coord_entry = AppendCoordBlock(inner_list, ext.xs.data() + prev, ext.ys.data() + prev,
-		                                    static_cast<idx_t>(n));
+		auto coord_entry =
+		    AppendCoordBlock(inner_list, ext.xs.data() + prev, ext.ys.data() + prev, static_cast<idx_t>(n));
 		inner_entries[outer_start + r] = coord_entry;
 		prev = end;
 	}
 	ListVector::SetListSize(result, outer_start + num_inner);
-	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t{outer_start, num_inner};
+	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t {outer_start, num_inner};
 }
 
 // LIST(LIST(LIST(STRUCT(x,y)))) — MultiPolygon.
@@ -563,11 +563,11 @@ static void WriteMultiPolygon(Vector &result, idx_t row, const CoordExtractor &e
 			coord_idx_start = coord_end;
 		}
 		ListVector::SetListSize(poly_list, ring_start + static_cast<idx_t>(rings_in_poly));
-		poly_entries[poly_start + p] = list_entry_t{ring_start, static_cast<idx_t>(rings_in_poly)};
+		poly_entries[poly_start + p] = list_entry_t {ring_start, static_cast<idx_t>(rings_in_poly)};
 		ring_idx_start = ring_idx_end;
 	}
 	ListVector::SetListSize(result, poly_start + num_polys);
-	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t{poly_start, num_polys};
+	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t {poly_start, num_polys};
 }
 
 // Generic driver: parse each row, type-check, dispatch to the per-shape writer.
@@ -593,7 +593,7 @@ static void StAsGeoArrowNestedFun(DataChunk &args, ExpressionState &state, Vecto
 		auto input_idx = input_data.sel->get_index(i);
 		if (!input_data.validity.RowIsValid(input_idx)) {
 			result_validity.SetInvalid(i);
-			FlatVector::GetData<list_entry_t>(result)[i] = list_entry_t{ListVector::GetListSize(result), 0};
+			FlatVector::GetData<list_entry_t>(result)[i] = list_entry_t {ListVector::GetListSize(result), 0};
 			continue;
 		}
 
@@ -606,8 +606,8 @@ static void StAsGeoArrowNestedFun(DataChunk &args, ExpressionState &state, Vecto
 
 		if (extractor.geometry_type != EXPECTED) {
 			GeoArrowWKBReaderReset(&wkb_reader);
-			throw InvalidInputException("%s: expected geometry type %d, got %d", fn_name,
-			                            static_cast<int>(EXPECTED), extractor.geometry_type);
+			throw InvalidInputException("%s: expected geometry type %d, got %d", fn_name, static_cast<int>(EXPECTED),
+			                            extractor.geometry_type);
 		}
 
 		WRITER(result, i, extractor);

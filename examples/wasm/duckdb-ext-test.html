@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>DuckDB WASM Extension Tester</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            max-width: 960px; margin: 2rem auto; padding: 0 1rem;
+            background: #1e1e1e; color: #d4d4d4; line-height: 1.5;
+        }
+        h1 { font-size: 1.2rem; color: #569cd6; margin-bottom: 0.5rem; }
+        .config { background: #252526; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+        .config label { display: block; margin-bottom: 0.3rem; color: #9cdcfe; font-size: 0.85rem; }
+        .config input { width: 100%; padding: 0.4rem; font-family: inherit; font-size: 0.9rem;
+                        background: #1e1e1e; color: #d4d4d4; border: 1px solid #444; border-radius: 3px; }
+        .config .row { display: flex; gap: 1rem; margin-bottom: 0.5rem; }
+        .config .row > div { flex: 1; }
+        #sql { width: 100%; height: 100px; font-family: inherit; font-size: 0.9rem;
+               background: #252526; color: #d4d4d4; border: 1px solid #444; padding: 0.5rem;
+               border-radius: 3px; resize: vertical; }
+        .buttons { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
+        button { padding: 0.4rem 1rem; font-size: 0.9rem; cursor: pointer;
+                 background: #0e639c; color: #fff; border: none; border-radius: 3px; }
+        button:hover { background: #1177bb; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.secondary { background: #333; }
+        #status { padding: 0.5rem; border-radius: 3px; margin-bottom: 0.5rem; font-size: 0.85rem; }
+        #status.loading { background: #2d2d00; color: #cca700; }
+        #status.ready { background: #0d260d; color: #6a9955; }
+        #status.error { background: #260d0d; color: #f44747; }
+        #output { background: #111; color: #eee; padding: 1rem; border-radius: 6px;
+                  overflow-x: auto; white-space: pre-wrap; min-height: 200px; max-height: 500px;
+                  overflow-y: auto; font-size: 0.85rem; }
+        .ok { color: #6a9955; }
+        .err { color: #f44747; }
+        .info { color: #569cd6; }
+        .dim { color: #666; }
+    </style>
+</head>
+<body>
+    <h1>DuckDB WASM Extension Tester</h1>
+    <p class="dim">
+        Standalone test page for any DuckDB WASM extension. Configure via URL
+        params or the fields below, then click <b>Connect</b>.
+    </p>
+
+    <div class="config">
+        <div class="row">
+            <div>
+                <label for="ext-name">Extension name</label>
+                <input id="ext-name" type="text" value="duck_geoarrow" />
+            </div>
+            <div>
+                <label for="repo-url">Extension repo URL</label>
+                <input id="repo-url" type="text" value="http://localhost:9999" />
+            </div>
+        </div>
+        <div class="row">
+            <div>
+                <label for="duckdb-version">@duckdb/duckdb-wasm version</label>
+                <input id="duckdb-version" type="text" value="1.33.1-dev53.0" />
+            </div>
+        </div>
+    </div>
+
+    <div class="buttons">
+        <button id="btn-connect">Connect</button>
+        <button id="btn-clear" class="secondary">Clear output</button>
+    </div>
+
+    <div id="status">Not connected</div>
+
+    <textarea id="sql" placeholder="Type SQL here after connecting..."></textarea>
+    <div class="buttons">
+        <button id="btn-run" disabled>Run SQL (Ctrl+Enter)</button>
+        <button id="btn-check" class="secondary" disabled>Check extension</button>
+        <button id="btn-version" class="secondary" disabled>DuckDB version</button>
+    </div>
+
+    <pre id="output"></pre>
+
+    <script type="module">
+        // ---- Read URL params ----
+        const params = new URLSearchParams(location.search);
+        const extNameInput = document.getElementById('ext-name');
+        const repoUrlInput = document.getElementById('repo-url');
+        const duckdbVersionInput = document.getElementById('duckdb-version');
+
+        if (params.get('ext')) extNameInput.value = params.get('ext');
+        if (params.get('repo')) repoUrlInput.value = params.get('repo');
+        if (params.get('duckdb')) duckdbVersionInput.value = params.get('duckdb');
+
+        // ---- DOM refs ----
+        const output = document.getElementById('output');
+        const statusEl = document.getElementById('status');
+        const btnConnect = document.getElementById('btn-connect');
+        const btnRun = document.getElementById('btn-run');
+        const btnCheck = document.getElementById('btn-check');
+        const btnVersion = document.getElementById('btn-version');
+        const btnClear = document.getElementById('btn-clear');
+        const sqlArea = document.getElementById('sql');
+
+        let conn = null;
+
+        // ---- Logging ----
+        function log(msg, cls) {
+            const span = document.createElement('span');
+            span.className = cls || '';
+            span.textContent = msg + '\n';
+            output.appendChild(span);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function setStatus(text, cls) {
+            statusEl.textContent = text;
+            statusEl.className = cls;
+        }
+
+        // ---- Connect & load extension ----
+        btnConnect.addEventListener('click', async () => {
+            const extName = extNameInput.value.trim();
+            const repoUrl = repoUrlInput.value.trim();
+            const duckdbVer = duckdbVersionInput.value.trim();
+
+            if (!extName || !repoUrl || !duckdbVer) {
+                alert('Fill in all config fields.');
+                return;
+            }
+
+            btnConnect.disabled = true;
+            setStatus('Loading @duckdb/duckdb-wasm@' + duckdbVer + '...', 'loading');
+
+            try {
+                // Dynamic import so the version is configurable
+                const cdnUrl = `https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${duckdbVer}/+esm`;
+                const duckdb = await import(cdnUrl);
+
+                setStatus('Selecting bundle...', 'loading');
+                const bundles = duckdb.getJsDelivrBundles();
+                const bundle = await duckdb.selectBundle(bundles);
+
+                setStatus('Instantiating DuckDB WASM...', 'loading');
+                const workerUrl = URL.createObjectURL(
+                    new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+                );
+                const worker = new Worker(workerUrl);
+                const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+                await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+                await db.open({ allowUnsignedExtensions: true, path: ':memory:' });
+                URL.revokeObjectURL(workerUrl);
+
+                conn = await db.connect();
+
+                // Install and load the extension
+                setStatus('Installing ' + extName + '...', 'loading');
+                log("SET custom_extension_repository = '" + repoUrl + "';", 'info');
+                await conn.query(`SET custom_extension_repository = '${repoUrl}'`);
+
+                log('INSTALL ' + extName + ';', 'info');
+                await conn.query(`INSTALL ${extName}`);
+
+                log('LOAD ' + extName + ';', 'info');
+                await conn.query(`LOAD ${extName}`);
+
+                // Get DuckDB version for display
+                const verResult = await conn.query('SELECT version() AS v');
+                const ver = verResult.toArray()[0].v;
+
+                setStatus('Ready — ' + extName + ' loaded on DuckDB ' + ver, 'ready');
+                log('\n--- ' + extName + ' loaded successfully (DuckDB ' + ver + ') ---\n', 'ok');
+
+                btnRun.disabled = false;
+                btnCheck.disabled = false;
+                btnVersion.disabled = false;
+
+            } catch (e) {
+                setStatus('Failed: ' + e.message, 'error');
+                log('ERROR: ' + e.message, 'err');
+                console.error(e);
+                btnConnect.disabled = false;
+            }
+        });
+
+        // ---- Run SQL ----
+        async function runQuery() {
+            if (!conn) return;
+            const sql = sqlArea.value.trim();
+            if (!sql) return;
+
+            log('> ' + sql, 'dim');
+            try {
+                const result = await conn.query(sql);
+                const rows = result.toArray().map(r => {
+                    const obj = r.toJSON();
+                    const clean = {};
+                    for (const [k, v] of Object.entries(obj)) {
+                        clean[k] = typeof v === 'bigint' ? Number(v) : v;
+                    }
+                    return JSON.stringify(clean);
+                });
+                if (rows.length === 0) {
+                    log('(empty result)', 'ok');
+                } else {
+                    rows.forEach(r => log(r, 'ok'));
+                }
+            } catch (e) {
+                log('ERROR: ' + e.message, 'err');
+            }
+        }
+
+        btnRun.addEventListener('click', runQuery);
+
+        sqlArea.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                runQuery();
+            }
+        });
+
+        // ---- Shortcut buttons ----
+        const extNameForQuery = () => extNameInput.value.trim();
+
+        btnCheck.addEventListener('click', () => {
+            sqlArea.value = `SELECT extension_name, loaded, extension_version, install_mode
+FROM duckdb_extensions()
+WHERE extension_name = '${extNameForQuery()}';`;
+            runQuery();
+        });
+
+        btnVersion.addEventListener('click', () => {
+            sqlArea.value = 'SELECT version() AS duckdb_version;';
+            runQuery();
+        });
+
+        btnClear.addEventListener('click', () => { output.textContent = ''; });
+    </script>
+</body>
+</html>

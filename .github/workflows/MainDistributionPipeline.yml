@@ -28,3 +28,93 @@ jobs:
       ci_tools_version: v1.5.1
       extension_name: duck_geoarrow
       format_checks: 'format;tidy'
+
+  release:
+    name: Publish release
+    needs: duckdb-stable-build
+    # Run on versioned tag pushes, or on pushes to main
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: raw-artifacts
+
+      # Each artifact dir is named  duck_geoarrow-1.5.1-extension-<platform>
+      # and contains  build/release/extension/duck_geoarrow/duck_geoarrow.duckdb_extension
+      # Flatten & rename to  duck_geoarrow-<platform>.duckdb_extension for the release.
+      - name: Collect and rename extension binaries
+        run: |
+          mkdir -p dist
+          for artifact_dir in raw-artifacts/duck_geoarrow-*-extension-*/; do
+            platform=$(basename "$artifact_dir" | sed 's/duck_geoarrow-[^-]*-extension-//')
+            src=$(find "$artifact_dir" -name "duck_geoarrow.duckdb_extension" | head -1)
+            if [ -n "$src" ]; then
+              cp "$src" "dist/duck_geoarrow-${platform}.duckdb_extension"
+            fi
+          done
+          echo "=== release files ==="
+          ls -lh dist/
+
+      - name: Publish versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
+          body: |
+            Release **${{ github.ref_name }}** built against **DuckDB v1.5.1**.
+
+            ## Download
+
+            Pick the binary for your platform from the assets below, then load it in DuckDB:
+
+            ```sql
+            -- start DuckDB with unsigned extensions allowed
+            -- CLI:  duckdb -unsigned
+            LOAD '/path/to/duck_geoarrow-<platform>.duckdb_extension';
+            ```
+
+            | Platform | File |
+            |----------|------|
+            | Linux x86-64  | `duck_geoarrow-linux_amd64.duckdb_extension`  |
+            | Linux arm64   | `duck_geoarrow-linux_arm64.duckdb_extension`  |
+            | macOS x86-64  | `duck_geoarrow-osx_amd64.duckdb_extension`    |
+            | macOS arm64   | `duck_geoarrow-osx_arm64.duckdb_extension`    |
+            | Windows x86-64| `duck_geoarrow-windows_amd64.duckdb_extension`|
+          files: dist/*.duckdb_extension
+          make_latest: true
+          prerelease: false
+
+      - name: Update latest pre-release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest build"
+          body: |
+            Automated build from the `main` branch against **DuckDB v1.5.1**.
+
+            ## Download
+
+            Pick the binary for your platform from the assets below, then load it in DuckDB:
+
+            ```sql
+            -- start DuckDB with unsigned extensions allowed
+            -- CLI:  duckdb -unsigned
+            LOAD '/path/to/duck_geoarrow-<platform>.duckdb_extension';
+            ```
+
+            | Platform | File |
+            |----------|------|
+            | Linux x86-64  | `duck_geoarrow-linux_amd64.duckdb_extension`  |
+            | Linux arm64   | `duck_geoarrow-linux_arm64.duckdb_extension`  |
+            | macOS x86-64  | `duck_geoarrow-osx_amd64.duckdb_extension`    |
+            | macOS arm64   | `duck_geoarrow-osx_arm64.duckdb_extension`    |
+            | Windows x86-64| `duck_geoarrow-windows_amd64.duckdb_extension`|
+          files: dist/*.duckdb_extension
+          make_latest: false
+          prerelease: true

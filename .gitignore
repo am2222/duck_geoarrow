@@ -6,3 +6,6 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+.cache/*
+.cache/clangd/compile_commands.json
+.cache/clangd/release/compile_commands.json

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/am2222/duck_geoarrow/compare/v0.1.1...v0.1.2) (2026-04-15)
+
+
+### Bug Fixes
+
+* Remove outdated release step and add extension description file ([0ab152f](https://github.com/am2222/duck_geoarrow/commit/0ab152f5fee241dfe0399a6cf6e91586ece01b46))
+
 ## [0.1.1](https://github.com/am2222/duck_geoarrow/compare/v0.1.0...v0.1.1) (2026-04-15)
 
 

@@ -401,6 +401,246 @@ static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vecto
 	}
 }
 
+// --- st_asgeoarrowpoint: WKB (BLOB/GEOMETRY) → STRUCT(x DOUBLE, y DOUBLE) ---
+// Matches GeoArrow native encoding for Point: separated coordinates as Struct<x, y>.
+
+static void StAsGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto count = args.size();
+
+	UnifiedVectorFormat input_data;
+	args.data[0].ToUnifiedFormat(count, input_data);
+	auto input_entries = UnifiedVectorFormat::GetData<string_t>(input_data);
+
+	struct GeoArrowWKBReader wkb_reader;
+	GeoArrowWKBReaderInit(&wkb_reader);
+
+	CoordExtractor extractor;
+	struct GeoArrowVisitor visitor;
+	InitExtractVisitor(visitor, extractor);
+
+	struct GeoArrowError ga_error;
+
+	auto &children = StructVector::GetEntries(result);
+	auto x_data = FlatVector::GetData<double>(*children[0]);
+	auto y_data = FlatVector::GetData<double>(*children[1]);
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto input_idx = input_data.sel->get_index(i);
+		if (!input_data.validity.RowIsValid(input_idx)) {
+			result_validity.SetInvalid(i);
+			x_data[i] = 0;
+			y_data[i] = 0;
+			continue;
+		}
+
+		auto wkb_blob = input_entries[input_idx];
+
+		struct GeoArrowBufferView wkb_buf;
+		wkb_buf.data = reinterpret_cast<const uint8_t *>(wkb_blob.GetData());
+		wkb_buf.size_bytes = static_cast<int64_t>(wkb_blob.GetSize());
+
+		memset(&ga_error, 0, sizeof(ga_error));
+		visitor.error = &ga_error;
+
+		visitor.feat_start(&visitor);
+		int rc = GeoArrowWKBReaderVisit(&wkb_reader, wkb_buf, &visitor);
+		if (rc != GEOARROW_OK) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw InvalidInputException("st_asgeoarrowpoint: invalid WKB - " + string(ga_error.message));
+		}
+		visitor.feat_end(&visitor);
+
+		if (extractor.geometry_type != GEOARROW_GEOMETRY_TYPE_POINT) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw InvalidInputException(
+			    "st_asgeoarrowpoint: expected POINT, got geometry type %d", extractor.geometry_type);
+		}
+		if (extractor.xs.size() != 1) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw InvalidInputException("st_asgeoarrowpoint: POINT must have exactly one coordinate");
+		}
+
+		x_data[i] = extractor.xs[0];
+		y_data[i] = extractor.ys[0];
+	}
+
+	GeoArrowWKBReaderReset(&wkb_reader);
+}
+
+// --- GeoArrow native nested-list outputs (LineString/Polygon/Multi*) ---
+
+// Append n (x,y) coords into the STRUCT(x,y) child of `coord_list`.
+// Returns the (offset, length) entry in the coord-struct index space.
+static list_entry_t AppendCoordBlock(Vector &coord_list, const double *xs, const double *ys, idx_t n) {
+	auto current = ListVector::GetListSize(coord_list);
+	auto new_size = current + n;
+	ListVector::Reserve(coord_list, new_size);
+	auto &coord_struct = ListVector::GetEntry(coord_list);
+	auto &coord_children = StructVector::GetEntries(coord_struct);
+	auto x_data = FlatVector::GetData<double>(*coord_children[0]);
+	auto y_data = FlatVector::GetData<double>(*coord_children[1]);
+	for (idx_t k = 0; k < n; k++) {
+		x_data[current + k] = xs[k];
+		y_data[current + k] = ys[k];
+	}
+	ListVector::SetListSize(coord_list, new_size);
+	return list_entry_t{current, n};
+}
+
+// Parse one WKB feature into `extractor`. Throws on parse error. Caller must reset reader.
+static void ParseWKBRow(GeoArrowWKBReader &reader, GeoArrowVisitor &visitor, GeoArrowError &err,
+                        string_t wkb, const char *fn_name) {
+	GeoArrowBufferView buf;
+	buf.data = reinterpret_cast<const uint8_t *>(wkb.GetData());
+	buf.size_bytes = static_cast<int64_t>(wkb.GetSize());
+	memset(&err, 0, sizeof(err));
+	visitor.error = &err;
+	visitor.feat_start(&visitor);
+	int rc = GeoArrowWKBReaderVisit(&reader, buf, &visitor);
+	if (rc != GEOARROW_OK) {
+		throw InvalidInputException(string(fn_name) + ": invalid WKB - " + string(err.message));
+	}
+	visitor.feat_end(&visitor);
+}
+
+// Template: LIST(STRUCT(x,y)) output — used by LineString (one run of coords) and
+// MultiPoint (one coord per sub-point; we still emit a single flat list of verts).
+// `take_all_as_one_ring` = true for LineString (use xs/ys directly as one list);
+// MultiPoint also flattens to one list of coords, so same logic applies.
+static void WriteListOfCoords(Vector &result, idx_t row, const CoordExtractor &ext) {
+	auto entry = AppendCoordBlock(result, ext.xs.data(), ext.ys.data(), ext.xs.size());
+	FlatVector::GetData<list_entry_t>(result)[row] = entry;
+}
+
+// LIST(LIST(STRUCT(x,y))) — used by Polygon (rings) and MultiLineString (linestrings).
+// `ring_offsets` gives the end index (in xs/ys) of each inner list.
+static void WriteListOfListOfCoords(Vector &result, idx_t row, const CoordExtractor &ext) {
+	idx_t num_inner = ext.ring_offsets.size();
+	idx_t outer_start = ListVector::GetListSize(result);
+	ListVector::Reserve(result, outer_start + num_inner);
+	auto &inner_list = ListVector::GetEntry(result);
+	auto inner_entries = FlatVector::GetData<list_entry_t>(inner_list);
+
+	int32_t prev = 0;
+	for (idx_t r = 0; r < num_inner; r++) {
+		int32_t end = ext.ring_offsets[r];
+		int32_t n = end - prev;
+		auto coord_entry = AppendCoordBlock(inner_list, ext.xs.data() + prev, ext.ys.data() + prev,
+		                                    static_cast<idx_t>(n));
+		inner_entries[outer_start + r] = coord_entry;
+		prev = end;
+	}
+	ListVector::SetListSize(result, outer_start + num_inner);
+	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t{outer_start, num_inner};
+}
+
+// LIST(LIST(LIST(STRUCT(x,y)))) — MultiPolygon.
+static void WriteMultiPolygon(Vector &result, idx_t row, const CoordExtractor &ext) {
+	idx_t num_polys = ext.geom_offsets.size();
+	idx_t poly_start = ListVector::GetListSize(result);
+	ListVector::Reserve(result, poly_start + num_polys);
+	auto &poly_list = ListVector::GetEntry(result);
+	auto poly_entries = FlatVector::GetData<list_entry_t>(poly_list);
+
+	int32_t ring_idx_start = 0;
+	int32_t coord_idx_start = 0;
+	for (idx_t p = 0; p < num_polys; p++) {
+		int32_t ring_idx_end = ext.geom_offsets[p];
+		int32_t rings_in_poly = ring_idx_end - ring_idx_start;
+
+		idx_t ring_start = ListVector::GetListSize(poly_list);
+		ListVector::Reserve(poly_list, ring_start + static_cast<idx_t>(rings_in_poly));
+		auto &ring_list = ListVector::GetEntry(poly_list);
+		auto ring_entries = FlatVector::GetData<list_entry_t>(ring_list);
+
+		for (int32_t r = ring_idx_start; r < ring_idx_end; r++) {
+			int32_t coord_end = ext.ring_offsets[r];
+			int32_t n = coord_end - coord_idx_start;
+			auto coord_entry = AppendCoordBlock(ring_list, ext.xs.data() + coord_idx_start,
+			                                    ext.ys.data() + coord_idx_start, static_cast<idx_t>(n));
+			ring_entries[ring_start + (r - ring_idx_start)] = coord_entry;
+			coord_idx_start = coord_end;
+		}
+		ListVector::SetListSize(poly_list, ring_start + static_cast<idx_t>(rings_in_poly));
+		poly_entries[poly_start + p] = list_entry_t{ring_start, static_cast<idx_t>(rings_in_poly)};
+		ring_idx_start = ring_idx_end;
+	}
+	ListVector::SetListSize(result, poly_start + num_polys);
+	FlatVector::GetData<list_entry_t>(result)[row] = list_entry_t{poly_start, num_polys};
+}
+
+// Generic driver: parse each row, type-check, dispatch to the per-shape writer.
+template <enum GeoArrowGeometryType EXPECTED, void (*WRITER)(Vector &, idx_t, const CoordExtractor &)>
+static void StAsGeoArrowNestedFun(DataChunk &args, ExpressionState &state, Vector &result, const char *fn_name) {
+	auto count = args.size();
+
+	UnifiedVectorFormat input_data;
+	args.data[0].ToUnifiedFormat(count, input_data);
+	auto input_entries = UnifiedVectorFormat::GetData<string_t>(input_data);
+
+	struct GeoArrowWKBReader wkb_reader;
+	GeoArrowWKBReaderInit(&wkb_reader);
+
+	CoordExtractor extractor;
+	struct GeoArrowVisitor visitor;
+	InitExtractVisitor(visitor, extractor);
+
+	struct GeoArrowError ga_error;
+	auto &result_validity = FlatVector::Validity(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto input_idx = input_data.sel->get_index(i);
+		if (!input_data.validity.RowIsValid(input_idx)) {
+			result_validity.SetInvalid(i);
+			FlatVector::GetData<list_entry_t>(result)[i] = list_entry_t{ListVector::GetListSize(result), 0};
+			continue;
+		}
+
+		try {
+			ParseWKBRow(wkb_reader, visitor, ga_error, input_entries[input_idx], fn_name);
+		} catch (...) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw;
+		}
+
+		if (extractor.geometry_type != EXPECTED) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw InvalidInputException("%s: expected geometry type %d, got %d", fn_name,
+			                            static_cast<int>(EXPECTED), extractor.geometry_type);
+		}
+
+		WRITER(result, i, extractor);
+	}
+
+	GeoArrowWKBReaderReset(&wkb_reader);
+}
+
+static void StAsGeoArrowLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StAsGeoArrowNestedFun<GEOARROW_GEOMETRY_TYPE_LINESTRING, WriteListOfCoords>(args, state, result,
+	                                                                            "st_asgeoarrowlinestring");
+}
+
+static void StAsGeoArrowPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StAsGeoArrowNestedFun<GEOARROW_GEOMETRY_TYPE_POLYGON, WriteListOfListOfCoords>(args, state, result,
+	                                                                               "st_asgeoarrowpolygon");
+}
+
+static void StAsGeoArrowMultiPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StAsGeoArrowNestedFun<GEOARROW_GEOMETRY_TYPE_MULTIPOINT, WriteListOfCoords>(args, state, result,
+	                                                                            "st_asgeoarrowmultipoint");
+}
+
+static void StAsGeoArrowMultiLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StAsGeoArrowNestedFun<GEOARROW_GEOMETRY_TYPE_MULTILINESTRING, WriteListOfListOfCoords>(
+	    args, state, result, "st_asgeoarrowmultilinestring");
+}
+
+static void StAsGeoArrowMultiPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StAsGeoArrowNestedFun<GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON, WriteMultiPolygon>(args, state, result,
+	                                                                              "st_asgeoarrowmultipolygon");
+}
+
 // --- duck_geoarrow_version: returns extension + geoarrow-c version ---
 
 static void DuckGeoarrowVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -429,6 +669,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto st_geomfromgeoarrow_func =
 	    ScalarFunction("st_geomfromgeoarrow", {geoarrow_struct}, LogicalType::GEOMETRY(), StGeomFromGeoArrowFun);
 	loader.RegisterFunction(st_geomfromgeoarrow_func);
+
+	// GeoArrow native-encoding output types (separated coords per spec):
+	//   Point           → STRUCT(x, y)
+	//   LineString      → LIST(STRUCT(x, y))
+	//   Polygon         → LIST(LIST(STRUCT(x, y)))
+	//   MultiPoint      → LIST(STRUCT(x, y))
+	//   MultiLineString → LIST(LIST(STRUCT(x, y)))
+	//   MultiPolygon    → LIST(LIST(LIST(STRUCT(x, y))))
+	auto coord_type = LogicalType::STRUCT({{"x", LogicalType::DOUBLE}, {"y", LogicalType::DOUBLE}});
+	auto linestring_type = LogicalType::LIST(coord_type);
+	auto polygon_type = LogicalType::LIST(linestring_type);
+	auto multipoint_type = LogicalType::LIST(coord_type);
+	auto multilinestring_type = LogicalType::LIST(linestring_type);
+	auto multipolygon_type = LogicalType::LIST(polygon_type);
+
+	auto register_native = [&](const char *name, LogicalType out, scalar_function_t fn) {
+		ScalarFunctionSet set(name);
+		set.AddFunction(ScalarFunction({LogicalType::GEOMETRY()}, out, fn));
+		set.AddFunction(ScalarFunction({LogicalType::BLOB}, out, fn));
+		loader.RegisterFunction(set);
+	};
+	register_native("st_asgeoarrowpoint", coord_type, StAsGeoArrowPointFun);
+	register_native("st_asgeoarrowlinestring", linestring_type, StAsGeoArrowLineStringFun);
+	register_native("st_asgeoarrowpolygon", polygon_type, StAsGeoArrowPolygonFun);
+	register_native("st_asgeoarrowmultipoint", multipoint_type, StAsGeoArrowMultiPointFun);
+	register_native("st_asgeoarrowmultilinestring", multilinestring_type, StAsGeoArrowMultiLineStringFun);
+	register_native("st_asgeoarrowmultipolygon", multipolygon_type, StAsGeoArrowMultiPolygonFun);
 
 	// duck_geoarrow_version: returns version info
 	auto version_func = ScalarFunction("duck_geoarrow_version", {}, LogicalType::VARCHAR, DuckGeoarrowVersionFun);

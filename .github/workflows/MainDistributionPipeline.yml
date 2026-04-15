@@ -88,33 +88,3 @@ jobs:
           files: dist/*.duckdb_extension
           make_latest: true
           prerelease: false
-
-      - name: Update latest pre-release
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "Latest build"
-          body: |
-            Automated build from the `main` branch against **DuckDB v1.5.1**.
-
-            ## Download
-
-            Pick the binary for your platform from the assets below, then load it in DuckDB:
-
-            ```sql
-            -- start DuckDB with unsigned extensions allowed
-            -- CLI:  duckdb -unsigned
-            LOAD '/path/to/duck_geoarrow-<platform>.duckdb_extension';
-            ```
-
-            | Platform | File |
-            |----------|------|
-            | Linux x86-64  | `duck_geoarrow-linux_amd64.duckdb_extension`  |
-            | Linux arm64   | `duck_geoarrow-linux_arm64.duckdb_extension`  |
-            | macOS x86-64  | `duck_geoarrow-osx_amd64.duckdb_extension`    |
-            | macOS arm64   | `duck_geoarrow-osx_arm64.duckdb_extension`    |
-            | Windows x86-64| `duck_geoarrow-windows_amd64.duckdb_extension`|
-          files: dist/*.duckdb_extension
-          make_latest: false
-          prerelease: true

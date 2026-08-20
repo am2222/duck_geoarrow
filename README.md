@@ -112,6 +112,62 @@ Roundtrip GEOMETRY through GeoArrow:
 SELECT st_geomfromgeoarrow(st_asgeoarrow(geom_column)) FROM my_table;
 ```
 
+### GeoArrow native encodings
+
+The functions above use a single flattened struct for every geometry type. The functions
+below use the [GeoArrow native encodings](https://geoarrow.org/format) instead — nested
+lists of separated (struct-of-x/y) coordinates, the layout GeoParquet, geoarrow-pyarrow
+and geopandas produce.
+
+| Geometry type | DuckDB type | GEOMETRY → GeoArrow | GeoArrow → GEOMETRY |
+|---|---|---|---|
+| Point | `STRUCT(x DOUBLE, y DOUBLE)` | `st_asgeoarrowpoint` | `st_geomfromgeoarrowpoint` |
+| LineString | `STRUCT(x, y)[]` | `st_asgeoarrowlinestring` | `st_geomfromgeoarrowlinestring` |
+| Polygon | `STRUCT(x, y)[][]` | `st_asgeoarrowpolygon` | `st_geomfromgeoarrowpolygon` |
+| MultiPoint | `STRUCT(x, y)[]` | `st_asgeoarrowmultipoint` | `st_geomfromgeoarrowmultipoint` |
+| MultiLineString | `STRUCT(x, y)[][]` | `st_asgeoarrowmultilinestring` | `st_geomfromgeoarrowmultilinestring` |
+| MultiPolygon | `STRUCT(x, y)[][][]` | `st_asgeoarrowmultipolygon` | `st_geomfromgeoarrowmultipolygon` |
+
+The `st_asgeoarrow*` functions accept `GEOMETRY` or `BLOB` (WKB) and error if the input is
+not the expected geometry type. The `st_geomfromgeoarrow*` functions return `GEOMETRY`.
+
+There is one function per geometry type rather than one overloaded name because the DuckDB
+types collide: LineString and MultiPoint are both `STRUCT(x, y)[]`, and Polygon and
+MultiLineString are both `STRUCT(x, y)[][]`. The name is what disambiguates them.
+
+**Examples**
+
+Round-trip a polygon through its native encoding:
+```sql
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'::GEOMETRY));
+-- POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))
+```
+
+Read a GeoArrow-encoded GeoParquet file written by geopandas. A column written with
+`encoding="polygon"` arrives in DuckDB as `STRUCT(x DOUBLE, y DOUBLE)[][]`, which
+`st_geomfromgeoarrowpolygon` consumes directly:
+```sql
+SELECT county_name, st_geomfromgeoarrowpolygon(geometry) AS geom
+FROM read_parquet('county_regions.parquet');
+```
+
+Build a geometry from ordinary DuckDB values:
+```sql
+SELECT st_geomfromgeoarrowpoint({'x': 30.0, 'y': 10.0});
+-- POINT (30 10)
+```
+
+**Notes**
+
+- XY only. GeoArrow's Z/M/ZM and interleaved variants are not registered yet.
+- `NULL` input produces `NULL` output. A `NULL` *inside* a list (a null ring, say) is read
+  as an empty ring rather than an error, since the GeoArrow native encoding only carries
+  validity at the top level.
+- The `st_geomfromgeoarrow*` functions are thin wrappers: the input vector is exported
+  through DuckDB's Arrow bridge and walked by `geoarrow-c`'s
+  `GeoArrowArrayViewVisitNative`, so all nesting, offset and geometry-type handling comes
+  from the library rather than from this extension.
+
 ## Building
 
 ### Build steps

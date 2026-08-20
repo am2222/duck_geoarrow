@@ -7,6 +7,7 @@
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/common/arrow/arrow_converter.hpp"
 
 #include "geoarrow/geoarrow.h"
 
@@ -216,6 +217,70 @@ static void StAsGeoArrowWKBFun(DataChunk &args, ExpressionState &state, Vector &
 	GeoArrowWKBReaderReset(&wkb_reader);
 }
 
+// --- Shared plumbing for GeoArrow → GEOMETRY conversions ---
+
+// RAII: a GeoArrowWKBWriter that is always reset, even if we throw mid-way.
+struct WKBWriterGuard {
+	struct GeoArrowWKBWriter writer;
+	WKBWriterGuard() {
+		GeoArrowWKBWriterInit(&writer);
+	}
+	~WKBWriterGuard() {
+		GeoArrowWKBWriterReset(&writer);
+	}
+};
+
+// RAII: an ArrowArray that is always released.
+struct ArrowArrayGuard {
+	struct ArrowArray array;
+	ArrowArrayGuard() {
+		memset(&array, 0, sizeof(array));
+	}
+	~ArrowArrayGuard() {
+		if (array.release) {
+			array.release(&array);
+		}
+	}
+};
+
+// Copy a finished WKB writer array (one feature per row) into a GEOMETRY vector.
+static void WKBArrayToVector(const struct ArrowArray &wkb, Vector &result, idx_t count, const char *fn_name) {
+	if (wkb.length != static_cast<int64_t>(count)) {
+		throw InternalException("%s: WKB writer produced %lld features for %lld rows", fn_name,
+		                        static_cast<long long>(wkb.length), static_cast<long long>(count));
+	}
+	auto validity = static_cast<const uint8_t *>(wkb.buffers[0]);
+	auto offsets = static_cast<const int32_t *>(wkb.buffers[1]);
+	auto data = static_cast<const char *>(wkb.buffers[2]);
+
+	auto out = FlatVector::GetData<string_t>(result);
+	auto &result_validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < count; i++) {
+		// Arrow validity bitmaps are LSB-first
+		if (validity && !((validity[i / 8] >> (i % 8)) & 1)) {
+			result_validity.SetInvalid(i);
+			continue;
+		}
+		auto start = offsets[i];
+		out[i] = StringVector::AddStringOrBlob(result, data + start, static_cast<idx_t>(offsets[i + 1] - start));
+	}
+}
+
+// Export one DuckDB vector as an Arrow array whose layout geoarrow-c can read.
+static void ExportVectorToArrow(Vector &input, idx_t count, ArrowArrayGuard &out) {
+	DataChunk arrow_input;
+	arrow_input.InitializeEmpty({input.GetType()});
+	arrow_input.data[0].Reference(input);
+	arrow_input.SetCardinality(count);
+
+	// Default ClientProperties are exactly what geoarrow-c requires: 32-bit offsets
+	// (ArrowOffsetSize::REGULAR) and arrow_use_list_view = false. Deliberately NOT taken
+	// from the session - `SET arrow_output_list_view = true` would emit 3-buffer list-view
+	// arrays that GeoArrowArrayViewSetArray rejects.
+	ClientProperties options;
+	ArrowConverter::ToArrowArray(arrow_input, &out.array, options, {});
+}
+
 // --- st_geomfromgeoarrow: GeoArrow STRUCT → WKB BLOB ---
 
 // Helper: build a GeoArrowCoordView from separated x/y arrays
@@ -316,89 +381,135 @@ static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const dou
 
 static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
+	if (count == 0) {
+		return;
+	}
 
-	// Input STRUCT children
+	// Flatten so the STRUCT children are addressable by row index: a constant or
+	// dictionary-encoded input has children shorter than `count`.
 	auto &input = args.data[0];
+	input.Flatten(count);
+
 	auto &in_children = StructVector::GetEntries(input);
 	auto &type_vec = *in_children[0];
 	auto &xs_vec = *in_children[1];
 	auto &ys_vec = *in_children[2];
 	auto &ring_off_vec = *in_children[3];
 	auto &geom_off_vec = *in_children[4];
+	auto &input_validity = FlatVector::Validity(input);
 
-	UnifiedVectorFormat input_format;
-	input.ToUnifiedFormat(count, input_format);
-	auto &result_validity = FlatVector::Validity(result);
+	// One writer for the whole chunk; null rows become null features.
+	WKBWriterGuard writer;
+	struct GeoArrowVisitor visitor;
+	GeoArrowWKBWriterInitVisitor(&writer.writer, &visitor);
+
+	struct GeoArrowError ga_error;
+	memset(&ga_error, 0, sizeof(ga_error));
+	visitor.error = &ga_error;
 
 	for (idx_t i = 0; i < count; i++) {
-		auto input_idx = input_format.sel->get_index(i);
-		if (!input_format.validity.RowIsValid(input_idx)) {
-			result_validity.SetInvalid(i);
+		visitor.feat_start(&visitor);
+		if (!input_validity.RowIsValid(i)) {
+			visitor.null_feat(&visitor);
+			visitor.feat_end(&visitor);
 			continue;
 		}
 
-		// Read geometry_type
 		uint8_t geom_type = FlatVector::GetData<uint8_t>(type_vec)[i];
 
-		// Read xs
 		auto xs_entry = FlatVector::GetData<list_entry_t>(xs_vec)[i];
-		auto &xs_child = ListVector::GetEntry(xs_vec);
-		auto xs_data = FlatVector::GetData<double>(xs_child) + xs_entry.offset;
+		auto xs_data = FlatVector::GetData<double>(ListVector::GetEntry(xs_vec)) + xs_entry.offset;
 
-		// Read ys
 		auto ys_entry = FlatVector::GetData<list_entry_t>(ys_vec)[i];
-		auto &ys_child = ListVector::GetEntry(ys_vec);
-		auto ys_data = FlatVector::GetData<double>(ys_child) + ys_entry.offset;
+		auto ys_data = FlatVector::GetData<double>(ListVector::GetEntry(ys_vec)) + ys_entry.offset;
 
-		// Read ring_offsets
 		auto ro_entry = FlatVector::GetData<list_entry_t>(ring_off_vec)[i];
-		auto &ro_child = ListVector::GetEntry(ring_off_vec);
-		auto ro_data = FlatVector::GetData<int32_t>(ro_child) + ro_entry.offset;
+		auto ro_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(ring_off_vec)) + ro_entry.offset;
 
-		// Read geom_offsets
 		auto go_entry = FlatVector::GetData<list_entry_t>(geom_off_vec)[i];
-		auto &go_child = ListVector::GetEntry(geom_off_vec);
-		auto go_data = FlatVector::GetData<int32_t>(go_child) + go_entry.offset;
+		auto go_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(geom_off_vec)) + go_entry.offset;
 
-		// Set up WKB writer + visitor
-		struct GeoArrowWKBWriter wkb_writer;
-		GeoArrowWKBWriterInit(&wkb_writer);
-
-		struct GeoArrowVisitor visitor;
-		GeoArrowWKBWriterInitVisitor(&wkb_writer, &visitor);
-
-		struct GeoArrowError ga_error;
-		memset(&ga_error, 0, sizeof(ga_error));
-		visitor.error = &ga_error;
-
-		// Drive the visitor to produce WKB
-		visitor.feat_start(&visitor);
 		DriveVisitor(&visitor, geom_type, xs_data, ys_data, xs_entry.length, ro_data, ro_entry.length, go_data,
 		             go_entry.length);
 		visitor.feat_end(&visitor);
-
-		// Extract WKB from the writer's output
-		struct ArrowArray arr;
-		memset(&arr, 0, sizeof(arr));
-		int rc = GeoArrowWKBWriterFinish(&wkb_writer, &arr, &ga_error);
-		if (rc != GEOARROW_OK) {
-			GeoArrowWKBWriterReset(&wkb_writer);
-			throw InvalidInputException("st_geomfromgeoarrow: WKB writer failed - " + string(ga_error.message));
-		}
-
-		auto offsets = static_cast<const int32_t *>(arr.buffers[1]);
-		auto data = static_cast<const char *>(arr.buffers[2]);
-		int32_t start = offsets[0];
-		int32_t len = offsets[1] - start;
-
-		FlatVector::GetData<string_t>(result)[i] =
-		    StringVector::AddStringOrBlob(result, data + start, static_cast<idx_t>(len));
-
-		if (arr.release) {
-			arr.release(&arr);
-		}
-		GeoArrowWKBWriterReset(&wkb_writer);
 	}
+
+	ArrowArrayGuard wkb;
+	if (GeoArrowWKBWriterFinish(&writer.writer, &wkb.array, &ga_error) != GEOARROW_OK) {
+		throw InvalidInputException("st_geomfromgeoarrow: WKB writer failed - " + string(ga_error.message));
+	}
+
+	WKBArrayToVector(wkb.array, result, count, "st_geomfromgeoarrow");
+}
+
+// --- st_geomfromgeoarrow<type>: GeoArrow native encoding -> GEOMETRY ---
+//
+// These are thin wrappers around geoarrow-c. DuckDB exports the input vector through
+// its own Arrow bridge, then GeoArrowArrayViewVisitNative walks it and the WKB writer
+// serializes it. Nesting, offsets, null handling and dimension logic all live in the
+// library; the only code here is the two conversions at the edges.
+
+// GeoArrow native encoding -> GEOMETRY. GA_TYPE selects the encoding geoarrow-c expects;
+// the registered DuckDB input type is its structural equivalent.
+template <enum GeoArrowType GA_TYPE>
+static void StGeomFromNativeFun(DataChunk &args, Vector &result, const char *fn_name) {
+	auto count = args.size();
+	if (count == 0) {
+		return;
+	}
+
+	ArrowArrayGuard exported;
+	ExportVectorToArrow(args.data[0], count, exported);
+
+	struct GeoArrowError ga_error;
+	memset(&ga_error, 0, sizeof(ga_error));
+
+	struct GeoArrowArrayView view;
+	if (GeoArrowArrayViewInitFromType(&view, GA_TYPE) != GEOARROW_OK) {
+		throw InternalException(string(fn_name) + ": GeoArrowArrayViewInitFromType failed");
+	}
+	if (GeoArrowArrayViewSetArray(&view, exported.array.children[0], &ga_error) != GEOARROW_OK) {
+		throw InvalidInputException(string(fn_name) + ": " + string(ga_error.message));
+	}
+
+	WKBWriterGuard writer;
+	struct GeoArrowVisitor visitor;
+	GeoArrowWKBWriterInitVisitor(&writer.writer, &visitor);
+	visitor.error = &ga_error;
+	if (GeoArrowArrayViewVisitNative(&view, 0, static_cast<int64_t>(count), &visitor) != GEOARROW_OK) {
+		throw InvalidInputException(string(fn_name) + ": " + string(ga_error.message));
+	}
+
+	ArrowArrayGuard wkb;
+	if (GeoArrowWKBWriterFinish(&writer.writer, &wkb.array, &ga_error) != GEOARROW_OK) {
+		throw InvalidInputException(string(fn_name) + ": WKB writer failed - " + string(ga_error.message));
+	}
+
+	WKBArrayToVector(wkb.array, result, count, fn_name);
+}
+
+static void StGeomFromGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_POINT>(args, result, "st_geomfromgeoarrowpoint");
+}
+
+static void StGeomFromGeoArrowLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_LINESTRING>(args, result, "st_geomfromgeoarrowlinestring");
+}
+
+static void StGeomFromGeoArrowPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_POLYGON>(args, result, "st_geomfromgeoarrowpolygon");
+}
+
+static void StGeomFromGeoArrowMultiPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_MULTIPOINT>(args, result, "st_geomfromgeoarrowmultipoint");
+}
+
+static void StGeomFromGeoArrowMultiLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_MULTILINESTRING>(args, result, "st_geomfromgeoarrowmultilinestring");
+}
+
+static void StGeomFromGeoArrowMultiPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	StGeomFromNativeFun<GEOARROW_TYPE_MULTIPOLYGON>(args, result, "st_geomfromgeoarrowmultipolygon");
 }
 
 // --- st_asgeoarrowpoint: WKB (BLOB/GEOMETRY) → STRUCT(x DOUBLE, y DOUBLE) ---
@@ -696,6 +807,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	register_native("st_asgeoarrowmultipoint", multipoint_type, StAsGeoArrowMultiPointFun);
 	register_native("st_asgeoarrowmultilinestring", multilinestring_type, StAsGeoArrowMultiLineStringFun);
 	register_native("st_asgeoarrowmultipolygon", multipolygon_type, StAsGeoArrowMultiPolygonFun);
+
+	// GeoArrow native encoding → GEOMETRY. One name per geometry type: LineString and
+	// MultiPoint share the DuckDB type LIST(STRUCT(x, y)) (as do Polygon and
+	// MultiLineString), so they cannot be overloads of a single function.
+	auto register_from_native = [&](const char *name, const LogicalType &in, scalar_function_t fn) {
+		loader.RegisterFunction(ScalarFunction(name, {in}, LogicalType::GEOMETRY(), fn));
+	};
+	register_from_native("st_geomfromgeoarrowpoint", coord_type, StGeomFromGeoArrowPointFun);
+	register_from_native("st_geomfromgeoarrowlinestring", linestring_type, StGeomFromGeoArrowLineStringFun);
+	register_from_native("st_geomfromgeoarrowpolygon", polygon_type, StGeomFromGeoArrowPolygonFun);
+	register_from_native("st_geomfromgeoarrowmultipoint", multipoint_type, StGeomFromGeoArrowMultiPointFun);
+	register_from_native("st_geomfromgeoarrowmultilinestring", multilinestring_type,
+	                     StGeomFromGeoArrowMultiLineStringFun);
+	register_from_native("st_geomfromgeoarrowmultipolygon", multipolygon_type, StGeomFromGeoArrowMultiPolygonFun);
 
 	// duck_geoarrow_version: returns version info
 	auto version_func = ScalarFunction("duck_geoarrow_version", {}, LogicalType::VARCHAR, DuckGeoarrowVersionFun);

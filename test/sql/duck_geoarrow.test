@@ -66,3 +66,108 @@ query I
 SELECT (st_asgeoarrow('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))'::GEOMETRY)).ring_offsets;
 ----
 [5, 10]
+
+# ---------------------------------------------------------------------------
+# st_geomfromgeoarrow<type>: GeoArrow native encoding → GEOMETRY
+# ---------------------------------------------------------------------------
+
+# Round-trip every geometry type through its native encoding
+query I
+SELECT st_geomfromgeoarrowpoint(st_asgeoarrowpoint('POINT(30 10)'::GEOMETRY));
+----
+POINT (30 10)
+
+query I
+SELECT st_geomfromgeoarrowlinestring(st_asgeoarrowlinestring('LINESTRING(0 0, 1 1, 2 2)'::GEOMETRY));
+----
+LINESTRING (0 0, 1 1, 2 2)
+
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'::GEOMETRY));
+----
+POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))
+
+# Polygon with an interior ring
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))'::GEOMETRY));
+----
+POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))
+
+query I
+SELECT st_geomfromgeoarrowmultipoint(st_asgeoarrowmultipoint('MULTIPOINT(1 2, 3 4)'::GEOMETRY));
+----
+MULTIPOINT (1 2, 3 4)
+
+query I
+SELECT st_geomfromgeoarrowmultilinestring(st_asgeoarrowmultilinestring('MULTILINESTRING((0 0, 1 1), (2 2, 3 3))'::GEOMETRY));
+----
+MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))
+
+query I
+SELECT st_geomfromgeoarrowmultipolygon(st_asgeoarrowmultipolygon('MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))'::GEOMETRY));
+----
+MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))
+
+# Return type is GEOMETRY
+query I
+SELECT typeof(st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON((0 0, 1 0, 1 1, 0 0))'::GEOMETRY)));
+----
+GEOMETRY
+
+# Reads a plain DuckDB value of the matching shape, not just our own output
+query I
+SELECT st_geomfromgeoarrowpolygon([[{'x': 0.0, 'y': 0.0}, {'x': 1.0, 'y': 0.0}, {'x': 1.0, 'y': 1.0}, {'x': 0.0, 'y': 0.0}]]);
+----
+POLYGON ((0 0, 1 0, 1 1, 0 0))
+
+query I
+SELECT st_geomfromgeoarrowpoint({'x': 5.0, 'y': 6.0});
+----
+POINT (5 6)
+
+# NULL in, NULL out
+query I
+SELECT st_geomfromgeoarrowpolygon(NULL::STRUCT(x DOUBLE, y DOUBLE)[][]);
+----
+NULL
+
+# Multi-row, mixed with NULLs, exercising the batched writer
+query II
+SELECT id, st_geomfromgeoarrowpoint(pt) FROM (VALUES
+  (1, {'x': 1.0, 'y': 2.0}),
+  (2, NULL),
+  (3, {'x': -3.5, 'y': 4.25})
+) t(id, pt) ORDER BY id;
+----
+1	POINT (1 2)
+2	NULL
+3	POINT (-3.5 4.25)
+
+# A constant (broadcast) input must not read past the end of the struct children
+query I
+SELECT DISTINCT st_geomfromgeoarrowpoint({'x': 7.0, 'y': 8.0}) FROM range(4);
+----
+POINT (7 8)
+
+query I
+SELECT DISTINCT st_geomfromgeoarrow(st_asgeoarrow('POINT(9 10)'::GEOMETRY)) FROM range(4);
+----
+POINT (9 10)
+
+# Empty geometry
+query I
+SELECT st_geomfromgeoarrowlinestring([]::STRUCT(x DOUBLE, y DOUBLE)[]);
+----
+LINESTRING EMPTY
+
+# Full round-trip over many rows: GEOMETRY → native → GEOMETRY must be identity
+query I
+SELECT count(*) FROM (
+  SELECT g FROM (VALUES
+    ('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'),
+    ('POLYGON((1 1, 5 1, 5 5, 1 5, 1 1), (2 2, 3 2, 3 3, 2 3, 2 2))'),
+    ('POLYGON((-1 -1, 0 -1, 0 0, -1 0, -1 -1))')
+  ) t(g)
+) WHERE st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon(g::GEOMETRY))::VARCHAR <> g::GEOMETRY::VARCHAR;
+----
+0

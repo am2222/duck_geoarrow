@@ -13,7 +13,6 @@ import duckdb
 import pyarrow as pa
 import geoarrow.pyarrow as ga
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXT_PATH = REPO_ROOT / "build/release/extension/duck_geoarrow/duck_geoarrow.duckdb_extension"
 

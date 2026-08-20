@@ -246,8 +246,8 @@ struct ArrowArrayGuard {
 // Copy a finished WKB writer array (one feature per row) into a GEOMETRY vector.
 static void WKBArrayToVector(const struct ArrowArray &wkb, Vector &result, idx_t count, const char *fn_name) {
 	if (wkb.length != static_cast<int64_t>(count)) {
-		throw InternalException("%s: WKB writer produced %lld features for %lld rows", fn_name,
-		                        static_cast<long long>(wkb.length), static_cast<long long>(count));
+		throw InternalException(string(fn_name) + ": WKB writer produced " + to_string(wkb.length) + " features for " +
+		                        to_string(count) + " rows");
 	}
 	auto validity = static_cast<const uint8_t *>(wkb.buffers[0]);
 	auto offsets = static_cast<const int32_t *>(wkb.buffers[1]);
@@ -795,7 +795,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto multilinestring_type = LogicalType::LIST(linestring_type);
 	auto multipolygon_type = LogicalType::LIST(polygon_type);
 
-	auto register_native = [&](const char *name, LogicalType out, scalar_function_t fn) {
+	auto register_native = [&](const char *name, const LogicalType &out, scalar_function_t fn) {
 		ScalarFunctionSet set(name);
 		set.AddFunction(ScalarFunction({LogicalType::GEOMETRY()}, out, fn));
 		set.AddFunction(ScalarFunction({LogicalType::BLOB}, out, fn));

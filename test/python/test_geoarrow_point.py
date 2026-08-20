@@ -24,14 +24,16 @@ def main() -> None:
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{EXT_PATH}'")
 
-    con.execute("""
+    con.execute(
+        """
         CREATE TABLE pts AS
         SELECT * FROM (VALUES
             ('POINT(30 10)'::GEOMETRY),
             ('POINT(-1.5 2.25)'::GEOMETRY),
             ('POINT(0 0)'::GEOMETRY)
         ) AS t(g)
-        """)
+        """
+    )
 
     # Use arrow() to export the column as an Arrow table.
     reader = con.execute("SELECT st_asgeoarrowpoint(g) AS pt FROM pts").arrow()

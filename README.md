@@ -121,7 +121,7 @@ and geopandas produce.
 
 | Geometry type | DuckDB type | GEOMETRY → GeoArrow | GeoArrow → GEOMETRY |
 |---|---|---|---|
-| Point | `STRUCT(x DOUBLE, y DOUBLE)` | `st_asgeoarrowpoint` | `st_geomfromgeoarrowpoint` |
+| Point | `STRUCT(x, y)` | `st_asgeoarrowpoint` | `st_geomfromgeoarrowpoint` |
 | LineString | `STRUCT(x, y)[]` | `st_asgeoarrowlinestring` | `st_geomfromgeoarrowlinestring` |
 | Polygon | `STRUCT(x, y)[][]` | `st_asgeoarrowpolygon` | `st_geomfromgeoarrowpolygon` |
 | MultiPoint | `STRUCT(x, y)[]` | `st_asgeoarrowmultipoint` | `st_geomfromgeoarrowmultipoint` |
@@ -131,42 +131,89 @@ and geopandas produce.
 The `st_asgeoarrow*` functions accept `GEOMETRY` or `BLOB` (WKB) and error if the input is
 not the expected geometry type. The `st_geomfromgeoarrow*` functions return `GEOMETRY`.
 
-There is one function per geometry type rather than one overloaded name because the DuckDB
-types collide: LineString and MultiPoint are both `STRUCT(x, y)[]`, and Polygon and
-MultiLineString are both `STRUCT(x, y)[][]`. The name is what disambiguates them.
-
-**Examples**
-
-Round-trip a polygon through its native encoding:
 ```sql
 SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'::GEOMETRY));
 -- POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))
 ```
 
-Read a GeoArrow-encoded GeoParquet file written by geopandas. A column written with
-`encoding="polygon"` arrives in DuckDB as `STRUCT(x DOUBLE, y DOUBLE)[][]`, which
-`st_geomfromgeoarrowpolygon` consumes directly:
+### `st_geomfromgeoarrow` (generic form)
+
+**Signature**
+```
+GEOMETRY st_geomfromgeoarrow(geometry_type VARCHAR, value <native encoding>)
+```
+
+**Description**
+
+Reads any GeoArrow native encoding through a single function, with the geometry type given
+as a constant string: `point`, `linestring`, `polygon`, `multipoint`, `multilinestring` or
+`multipolygon`. Names are case- and separator-insensitive and may carry an explicit `z`,
+`m` or `zm` suffix.
+
+The type argument is required because the DuckDB types collide: LineString and MultiPoint
+are both `STRUCT(x, y)[]`, and Polygon and MultiLineString are both `STRUCT(x, y)[][]`, so
+a value on its own cannot say which geometry it is.
+
+**Examples**
+
 ```sql
-SELECT county_name, st_geomfromgeoarrowpolygon(geometry) AS geom
+SELECT st_geomfromgeoarrow('polygon', geometry) FROM 'counties.parquet';
+
+-- the same value read two ways
+SELECT st_geomfromgeoarrow('linestring', [{'x': 0.0, 'y': 0.0}, {'x': 1.0, 'y': 1.0}]),
+       st_geomfromgeoarrow('multipoint', [{'x': 0.0, 'y': 0.0}, {'x': 1.0, 'y': 1.0}]);
+-- LINESTRING (0 0, 1 1)  |  MULTIPOINT (0 0, 1 1)
+```
+
+Reading a GeoArrow-encoded GeoParquet file written by geopandas — a column written with
+`encoding="polygon"` arrives in DuckDB as `STRUCT(x DOUBLE, y DOUBLE)[][]`:
+```sql
+SELECT county_name, st_geomfromgeoarrow('polygon', geometry) AS geom
 FROM read_parquet('county_regions.parquet');
 ```
 
-Build a geometry from ordinary DuckDB values:
+### Z and M dimensions
+
+All functions support XY, XYZ, XYM and XYZM. GeoArrow carries the extra ordinates in the
+coordinate struct (`STRUCT(x, y, z)`, `STRUCT(x, y, m)`, `STRUCT(x, y, z, m)`), and the
+flat struct gains matching `zs` / `ms` lists.
+
+**Reading** needs no extra argument — the value's own type says which ordinates are
+present:
 ```sql
-SELECT st_geomfromgeoarrowpoint({'x': 30.0, 'y': 10.0});
--- POINT (30 10)
+SELECT st_geomfromgeoarrow('point', {'x': 1.0, 'y': 2.0, 'z': 3.0});   -- POINT Z (1 2 3)
+SELECT st_geomfromgeoarrowpoint({'x': 1.0, 'y': 2.0, 'm': 4.0});       -- POINT M (1 2 4)
 ```
+
+**Writing** takes the dimensions as a second argument, because a SQL function's return type
+has to be fixed before any data is seen:
+```sql
+SELECT st_asgeoarrowpoint('POINT Z (1 2 3)'::GEOMETRY, 'xyz');
+-- {'x': 1.0, 'y': 2.0, 'z': 3.0}
+
+SELECT typeof(st_asgeoarrowpolygon('POLYGON Z ((0 0 1, 1 0 1, 1 1 1, 0 0 1))'::GEOMETRY, 'xyz'));
+-- STRUCT(x DOUBLE, y DOUBLE, z DOUBLE)[][]
+
+SELECT st_asgeoarrow('LINESTRING ZM (0 0 1 5, 1 1 2 6)'::GEOMETRY, 'xyzm');
+-- {'geometry_type': 2, 'xs': [...], 'ys': [...], 'zs': [1.0, 2.0], 'ms': [5.0, 6.0], ...}
+```
+
+Accepted dimension names are `xy`, `xyz`, `xym`, `xyzm` (`z` and `zm` also work). Omitting
+the argument means `xy`, so **every one-argument call keeps the exact type it always had**
+and existing queries are unaffected.
+
+Dropping ordinates is allowed, inventing them is not: asking for `xyz` from a 2D geometry
+raises an error rather than filling in NaNs.
 
 **Notes**
 
-- XY only. GeoArrow's Z/M/ZM and interleaved variants are not registered yet.
 - `NULL` input produces `NULL` output. A `NULL` *inside* a list (a null ring, say) is read
   as an empty ring rather than an error, since the GeoArrow native encoding only carries
   validity at the top level.
 - The `st_geomfromgeoarrow*` functions are thin wrappers: the input vector is exported
   through DuckDB's Arrow bridge and walked by `geoarrow-c`'s
-  `GeoArrowArrayViewVisitNative`, so all nesting, offset and geometry-type handling comes
-  from the library rather than from this extension.
+  `GeoArrowArrayViewVisitNative`, so all nesting, offset, dimension and geometry-type
+  handling comes from the library rather than from this extension.
 
 ## Building
 

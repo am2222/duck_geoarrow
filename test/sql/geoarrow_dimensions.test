@@ -1,0 +1,277 @@
+# name: test/sql/geoarrow_dimensions.test
+# description: Z / M / ZM support across every GeoArrow function
+# group: [sql]
+
+require duck_geoarrow
+
+# Round-trip GEOMETRY -> GeoArrow native -> GEOMETRY for all six geometry types in all
+# four dimension combinations, through the per-type names. The write side takes the
+# dimensions as an argument (the output DuckDB type has to be fixed at bind time); the
+# read side infers them from the coordinate struct's fields.
+
+# --- XY ---
+query I
+SELECT st_geomfromgeoarrowpoint(st_asgeoarrowpoint('POINT (0 0)'::GEOMETRY, 'xy'))::VARCHAR = 'POINT (0 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowlinestring(st_asgeoarrowlinestring('LINESTRING (0 0, 4 0)'::GEOMETRY, 'xy'))::VARCHAR = 'LINESTRING (0 0, 4 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON ((0 0, 4 0, 4 4, 0 0))'::GEOMETRY, 'xy'))::VARCHAR = 'POLYGON ((0 0, 4 0, 4 4, 0 0))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipoint(st_asgeoarrowmultipoint('MULTIPOINT (0 0, 4 0)'::GEOMETRY, 'xy'))::VARCHAR = 'MULTIPOINT (0 0, 4 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultilinestring(st_asgeoarrowmultilinestring('MULTILINESTRING ((0 0, 4 0), (4 4, 8 8))'::GEOMETRY, 'xy'))::VARCHAR = 'MULTILINESTRING ((0 0, 4 0), (4 4, 8 8))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipolygon(st_asgeoarrowmultipolygon('MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0)))'::GEOMETRY, 'xy'))::VARCHAR = 'MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0)))'::GEOMETRY::VARCHAR;
+----
+true
+
+# --- XYZ ---
+query I
+SELECT st_geomfromgeoarrowpoint(st_asgeoarrowpoint('POINT Z (0 0 1)'::GEOMETRY, 'xyz'))::VARCHAR = 'POINT Z (0 0 1)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowlinestring(st_asgeoarrowlinestring('LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY, 'xyz'))::VARCHAR = 'LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON Z ((0 0 1, 4 0 2, 4 4 3, 0 0 1))'::GEOMETRY, 'xyz'))::VARCHAR = 'POLYGON Z ((0 0 1, 4 0 2, 4 4 3, 0 0 1))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipoint(st_asgeoarrowmultipoint('MULTIPOINT Z (0 0 1, 4 0 2)'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTIPOINT Z (0 0 1, 4 0 2)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultilinestring(st_asgeoarrowmultilinestring('MULTILINESTRING Z ((0 0 1, 4 0 2), (4 4 3, 8 8 4))'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTILINESTRING Z ((0 0 1, 4 0 2), (4 4 3, 8 8 4))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipolygon(st_asgeoarrowmultipolygon('MULTIPOLYGON Z (((0 0 1, 4 0 2, 4 4 3, 0 0 1)))'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTIPOLYGON Z (((0 0 1, 4 0 2, 4 4 3, 0 0 1)))'::GEOMETRY::VARCHAR;
+----
+true
+
+# --- XYM ---
+query I
+SELECT st_geomfromgeoarrowpoint(st_asgeoarrowpoint('POINT M (0 0 10)'::GEOMETRY, 'xym'))::VARCHAR = 'POINT M (0 0 10)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowlinestring(st_asgeoarrowlinestring('LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY, 'xym'))::VARCHAR = 'LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON M ((0 0 10, 4 0 11, 4 4 12, 0 0 10))'::GEOMETRY, 'xym'))::VARCHAR = 'POLYGON M ((0 0 10, 4 0 11, 4 4 12, 0 0 10))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipoint(st_asgeoarrowmultipoint('MULTIPOINT M (0 0 10, 4 0 11)'::GEOMETRY, 'xym'))::VARCHAR = 'MULTIPOINT M (0 0 10, 4 0 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultilinestring(st_asgeoarrowmultilinestring('MULTILINESTRING M ((0 0 10, 4 0 11), (4 4 12, 8 8 13))'::GEOMETRY, 'xym'))::VARCHAR = 'MULTILINESTRING M ((0 0 10, 4 0 11), (4 4 12, 8 8 13))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipolygon(st_asgeoarrowmultipolygon('MULTIPOLYGON M (((0 0 10, 4 0 11, 4 4 12, 0 0 10)))'::GEOMETRY, 'xym'))::VARCHAR = 'MULTIPOLYGON M (((0 0 10, 4 0 11, 4 4 12, 0 0 10)))'::GEOMETRY::VARCHAR;
+----
+true
+
+# --- XYZM ---
+query I
+SELECT st_geomfromgeoarrowpoint(st_asgeoarrowpoint('POINT ZM (0 0 1 10)'::GEOMETRY, 'xyzm'))::VARCHAR = 'POINT ZM (0 0 1 10)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowlinestring(st_asgeoarrowlinestring('LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY, 'xyzm'))::VARCHAR = 'LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowpolygon(st_asgeoarrowpolygon('POLYGON ZM ((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10))'::GEOMETRY, 'xyzm'))::VARCHAR = 'POLYGON ZM ((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipoint(st_asgeoarrowmultipoint('MULTIPOINT ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTIPOINT ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultilinestring(st_asgeoarrowmultilinestring('MULTILINESTRING ZM ((0 0 1 10, 4 0 2 11), (4 4 3 12, 8 8 4 13))'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTILINESTRING ZM ((0 0 1 10, 4 0 2 11), (4 4 3 12, 8 8 4 13))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrowmultipolygon(st_asgeoarrowmultipolygon('MULTIPOLYGON ZM (((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10)))'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTIPOLYGON ZM (((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10)))'::GEOMETRY::VARCHAR;
+----
+true
+
+# The same round-trips through the generic form. It needs no dimensions argument on the
+# read side: the value's own type says which ordinates are present.
+query I
+SELECT st_geomfromgeoarrow('point', st_asgeoarrowpoint('POINT (0 0)'::GEOMETRY, 'xy'))::VARCHAR = 'POINT (0 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('linestring', st_asgeoarrowlinestring('LINESTRING (0 0, 4 0)'::GEOMETRY, 'xy'))::VARCHAR = 'LINESTRING (0 0, 4 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('polygon', st_asgeoarrowpolygon('POLYGON ((0 0, 4 0, 4 4, 0 0))'::GEOMETRY, 'xy'))::VARCHAR = 'POLYGON ((0 0, 4 0, 4 4, 0 0))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipoint', st_asgeoarrowmultipoint('MULTIPOINT (0 0, 4 0)'::GEOMETRY, 'xy'))::VARCHAR = 'MULTIPOINT (0 0, 4 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multilinestring', st_asgeoarrowmultilinestring('MULTILINESTRING ((0 0, 4 0), (4 4, 8 8))'::GEOMETRY, 'xy'))::VARCHAR = 'MULTILINESTRING ((0 0, 4 0), (4 4, 8 8))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipolygon', st_asgeoarrowmultipolygon('MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0)))'::GEOMETRY, 'xy'))::VARCHAR = 'MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0)))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('point', st_asgeoarrowpoint('POINT Z (0 0 1)'::GEOMETRY, 'xyz'))::VARCHAR = 'POINT Z (0 0 1)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('linestring', st_asgeoarrowlinestring('LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY, 'xyz'))::VARCHAR = 'LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('polygon', st_asgeoarrowpolygon('POLYGON Z ((0 0 1, 4 0 2, 4 4 3, 0 0 1))'::GEOMETRY, 'xyz'))::VARCHAR = 'POLYGON Z ((0 0 1, 4 0 2, 4 4 3, 0 0 1))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipoint', st_asgeoarrowmultipoint('MULTIPOINT Z (0 0 1, 4 0 2)'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTIPOINT Z (0 0 1, 4 0 2)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multilinestring', st_asgeoarrowmultilinestring('MULTILINESTRING Z ((0 0 1, 4 0 2), (4 4 3, 8 8 4))'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTILINESTRING Z ((0 0 1, 4 0 2), (4 4 3, 8 8 4))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipolygon', st_asgeoarrowmultipolygon('MULTIPOLYGON Z (((0 0 1, 4 0 2, 4 4 3, 0 0 1)))'::GEOMETRY, 'xyz'))::VARCHAR = 'MULTIPOLYGON Z (((0 0 1, 4 0 2, 4 4 3, 0 0 1)))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('point', st_asgeoarrowpoint('POINT M (0 0 10)'::GEOMETRY, 'xym'))::VARCHAR = 'POINT M (0 0 10)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('linestring', st_asgeoarrowlinestring('LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY, 'xym'))::VARCHAR = 'LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('polygon', st_asgeoarrowpolygon('POLYGON M ((0 0 10, 4 0 11, 4 4 12, 0 0 10))'::GEOMETRY, 'xym'))::VARCHAR = 'POLYGON M ((0 0 10, 4 0 11, 4 4 12, 0 0 10))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipoint', st_asgeoarrowmultipoint('MULTIPOINT M (0 0 10, 4 0 11)'::GEOMETRY, 'xym'))::VARCHAR = 'MULTIPOINT M (0 0 10, 4 0 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multilinestring', st_asgeoarrowmultilinestring('MULTILINESTRING M ((0 0 10, 4 0 11), (4 4 12, 8 8 13))'::GEOMETRY, 'xym'))::VARCHAR = 'MULTILINESTRING M ((0 0 10, 4 0 11), (4 4 12, 8 8 13))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipolygon', st_asgeoarrowmultipolygon('MULTIPOLYGON M (((0 0 10, 4 0 11, 4 4 12, 0 0 10)))'::GEOMETRY, 'xym'))::VARCHAR = 'MULTIPOLYGON M (((0 0 10, 4 0 11, 4 4 12, 0 0 10)))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('point', st_asgeoarrowpoint('POINT ZM (0 0 1 10)'::GEOMETRY, 'xyzm'))::VARCHAR = 'POINT ZM (0 0 1 10)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('linestring', st_asgeoarrowlinestring('LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY, 'xyzm'))::VARCHAR = 'LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('polygon', st_asgeoarrowpolygon('POLYGON ZM ((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10))'::GEOMETRY, 'xyzm'))::VARCHAR = 'POLYGON ZM ((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipoint', st_asgeoarrowmultipoint('MULTIPOINT ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTIPOINT ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multilinestring', st_asgeoarrowmultilinestring('MULTILINESTRING ZM ((0 0 1 10, 4 0 2 11), (4 4 3 12, 8 8 4 13))'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTILINESTRING ZM ((0 0 1 10, 4 0 2 11), (4 4 3 12, 8 8 4 13))'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow('multipolygon', st_asgeoarrowmultipolygon('MULTIPOLYGON ZM (((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10)))'::GEOMETRY, 'xyzm'))::VARCHAR = 'MULTIPOLYGON ZM (((0 0 1 10, 4 0 2 11, 4 4 3 12, 0 0 1 10)))'::GEOMETRY::VARCHAR;
+----
+true
+
+# The flat struct representation also carries z / m
+query I
+SELECT st_geomfromgeoarrow(st_asgeoarrow('LINESTRING (0 0, 4 0)'::GEOMETRY, 'xy'))::VARCHAR = 'LINESTRING (0 0, 4 0)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow(st_asgeoarrow('LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY, 'xyz'))::VARCHAR = 'LINESTRING Z (0 0 1, 4 0 2)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow(st_asgeoarrow('LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY, 'xym'))::VARCHAR = 'LINESTRING M (0 0 10, 4 0 11)'::GEOMETRY::VARCHAR;
+----
+true
+
+query I
+SELECT st_geomfromgeoarrow(st_asgeoarrow('LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY, 'xyzm'))::VARCHAR = 'LINESTRING ZM (0 0 1 10, 4 0 2 11)'::GEOMETRY::VARCHAR;
+----
+true

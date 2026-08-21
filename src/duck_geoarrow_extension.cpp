@@ -8,18 +8,239 @@
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 
 #include "geoarrow/geoarrow.h"
 
 namespace duckdb {
 
-// The GeoArrow struct type used as output for st_asgeoarrow and input for st_geomfromgeoarrow
-static LogicalType GeoArrowStructType() {
-	return LogicalType::STRUCT({{"geometry_type", LogicalType::UTINYINT},
-	                            {"xs", LogicalType::LIST(LogicalType::DOUBLE)},
-	                            {"ys", LogicalType::LIST(LogicalType::DOUBLE)},
-	                            {"ring_offsets", LogicalType::LIST(LogicalType::INTEGER)},
-	                            {"geom_offsets", LogicalType::LIST(LogicalType::INTEGER)}});
+// --- Dimensions (XY / XYZ / XYM / XYZM) ---
+//
+// GeoArrow encodes dimensions in the coordinate struct's fields: STRUCT(x, y),
+// STRUCT(x, y, z), STRUCT(x, y, m) or STRUCT(x, y, z, m). geoarrow-c has one type
+// constant per (geometry type, dimensions) pair, built by GeoArrowMakeType(), so all
+// dimension handling here reduces to picking the right constant.
+
+// Number of ordinates carried by a set of dimensions.
+static idx_t DimensionCount(enum GeoArrowDimensions dims) {
+	switch (dims) {
+	case GEOARROW_DIMENSIONS_XY:
+		return 2;
+	case GEOARROW_DIMENSIONS_XYZ:
+	case GEOARROW_DIMENSIONS_XYM:
+		return 3;
+	case GEOARROW_DIMENSIONS_XYZM:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+// The GeoArrow coordinate struct for a set of dimensions.
+static LogicalType CoordStructType(enum GeoArrowDimensions dims) {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("x", LogicalType::DOUBLE);
+	fields.emplace_back("y", LogicalType::DOUBLE);
+	if (dims == GEOARROW_DIMENSIONS_XYZ || dims == GEOARROW_DIMENSIONS_XYZM) {
+		fields.emplace_back("z", LogicalType::DOUBLE);
+	}
+	if (dims == GEOARROW_DIMENSIONS_XYM || dims == GEOARROW_DIMENSIONS_XYZM) {
+		fields.emplace_back("m", LogicalType::DOUBLE);
+	}
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+// Dimensions implied by a coordinate struct's field names, or UNKNOWN if it is not one.
+static enum GeoArrowDimensions DimensionsFromCoordStruct(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT) {
+		return GEOARROW_DIMENSIONS_UNKNOWN;
+	}
+	string names;
+	for (auto &child : StructType::GetChildTypes(type)) {
+		if (child.second.id() != LogicalTypeId::DOUBLE) {
+			return GEOARROW_DIMENSIONS_UNKNOWN;
+		}
+		names += StringUtil::Lower(child.first);
+	}
+	if (names == "xy") {
+		return GEOARROW_DIMENSIONS_XY;
+	}
+	if (names == "xyz") {
+		return GEOARROW_DIMENSIONS_XYZ;
+	}
+	if (names == "xym") {
+		return GEOARROW_DIMENSIONS_XYM;
+	}
+	if (names == "xyzm") {
+		return GEOARROW_DIMENSIONS_XYZM;
+	}
+	return GEOARROW_DIMENSIONS_UNKNOWN;
+}
+
+// How many levels of LIST wrap the coordinate struct in a native encoding.
+static int NativeNestingDepth(enum GeoArrowGeometryType geometry_type) {
+	switch (geometry_type) {
+	case GEOARROW_GEOMETRY_TYPE_POINT:
+		return 0;
+	case GEOARROW_GEOMETRY_TYPE_LINESTRING:
+	case GEOARROW_GEOMETRY_TYPE_MULTIPOINT:
+		return 1;
+	case GEOARROW_GEOMETRY_TYPE_POLYGON:
+	case GEOARROW_GEOMETRY_TYPE_MULTILINESTRING:
+		return 2;
+	case GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON:
+		return 3;
+	default:
+		return -1;
+	}
+}
+
+// The DuckDB type of a GeoArrow native encoding.
+static LogicalType NativeType(enum GeoArrowGeometryType geometry_type, enum GeoArrowDimensions dims) {
+	auto type = CoordStructType(dims);
+	for (int i = 0; i < NativeNestingDepth(geometry_type); i++) {
+		type = LogicalType::LIST(type);
+	}
+	return type;
+}
+
+// Peel LIST levels off a native encoding, reporting the depth and the coordinate struct's
+// dimensions. Returns false if `type` is not a nesting of a GeoArrow coordinate struct.
+static bool InspectNativeType(const LogicalType &type, int &depth, enum GeoArrowDimensions &dims) {
+	depth = 0;
+	auto current = type;
+	while (current.id() == LogicalTypeId::LIST) {
+		current = ListType::GetChildType(current);
+		depth++;
+		if (depth > 3) {
+			return false;
+		}
+	}
+	dims = DimensionsFromCoordStruct(current);
+	return dims != GEOARROW_DIMENSIONS_UNKNOWN;
+}
+
+// Parse a geometry type name, optionally carrying a dimension suffix: "polygon",
+// "polygon_z", "POLYGON ZM" and "multipointm" all parse. No GeoArrow geometry type name
+// ends in 'z' or 'm', so stripping a suffix is unambiguous. `dims` is left UNKNOWN when
+// the name carries no suffix, in which case the caller infers it from the value's type.
+static bool ParseGeometryTypeName(const string &name, enum GeoArrowGeometryType &geometry_type,
+                                  enum GeoArrowDimensions &dims) {
+	string norm;
+	for (auto c : StringUtil::Lower(name)) {
+		if (c != ' ' && c != '_' && c != '-') {
+			norm += c;
+		}
+	}
+
+	dims = GEOARROW_DIMENSIONS_UNKNOWN;
+	if (StringUtil::EndsWith(norm, "zm")) {
+		dims = GEOARROW_DIMENSIONS_XYZM;
+		norm = norm.substr(0, norm.size() - 2);
+	} else if (StringUtil::EndsWith(norm, "z")) {
+		dims = GEOARROW_DIMENSIONS_XYZ;
+		norm = norm.substr(0, norm.size() - 1);
+	} else if (StringUtil::EndsWith(norm, "m")) {
+		dims = GEOARROW_DIMENSIONS_XYM;
+		norm = norm.substr(0, norm.size() - 1);
+	}
+
+	if (norm == "point") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_POINT;
+	} else if (norm == "linestring") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_LINESTRING;
+	} else if (norm == "polygon") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_POLYGON;
+	} else if (norm == "multipoint") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_MULTIPOINT;
+	} else if (norm == "multilinestring") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_MULTILINESTRING;
+	} else if (norm == "multipolygon") {
+		geometry_type = GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+// Parse a dimension name: "xy", "xyz", "z", "zm", "m".
+static bool ParseDimensionName(const string &name, enum GeoArrowDimensions &dims) {
+	string norm;
+	for (auto c : StringUtil::Lower(name)) {
+		if (c != ' ' && c != '_' && c != '-') {
+			norm += c;
+		}
+	}
+	if (norm == "xy") {
+		dims = GEOARROW_DIMENSIONS_XY;
+	} else if (norm == "xyz" || norm == "z") {
+		dims = GEOARROW_DIMENSIONS_XYZ;
+	} else if (norm == "xym" || norm == "m") {
+		dims = GEOARROW_DIMENSIONS_XYM;
+	} else if (norm == "xyzm" || norm == "zm") {
+		dims = GEOARROW_DIMENSIONS_XYZM;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static const char *DimensionSuffix(enum GeoArrowDimensions dims) {
+	switch (dims) {
+	case GEOARROW_DIMENSIONS_XYZ:
+		return " Z";
+	case GEOARROW_DIMENSIONS_XYM:
+		return " M";
+	case GEOARROW_DIMENSIONS_XYZM:
+		return " ZM";
+	default:
+		return "";
+	}
+}
+
+// The flat GeoArrow struct used as output for st_asgeoarrow and input for
+// st_geomfromgeoarrow. `zs` / `ms` are present only for the dimensions that need them, so
+// the XY type is byte-identical to the one this extension has always produced.
+static LogicalType GeoArrowStructType(enum GeoArrowDimensions dims = GEOARROW_DIMENSIONS_XY) {
+	auto double_list = LogicalType::LIST(LogicalType::DOUBLE);
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("geometry_type", LogicalType::UTINYINT);
+	fields.emplace_back("xs", double_list);
+	fields.emplace_back("ys", double_list);
+	if (dims == GEOARROW_DIMENSIONS_XYZ || dims == GEOARROW_DIMENSIONS_XYZM) {
+		fields.emplace_back("zs", double_list);
+	}
+	if (dims == GEOARROW_DIMENSIONS_XYM || dims == GEOARROW_DIMENSIONS_XYZM) {
+		fields.emplace_back("ms", double_list);
+	}
+	fields.emplace_back("ring_offsets", LogicalType::LIST(LogicalType::INTEGER));
+	fields.emplace_back("geom_offsets", LogicalType::LIST(LogicalType::INTEGER));
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+// Dimensions implied by a flat GeoArrow struct, or UNKNOWN if it is not one.
+static enum GeoArrowDimensions DimensionsFromFlatStruct(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT) {
+		return GEOARROW_DIMENSIONS_UNKNOWN;
+	}
+	bool has_z = false;
+	bool has_m = false;
+	for (auto &child : StructType::GetChildTypes(type)) {
+		auto name = StringUtil::Lower(child.first);
+		has_z = has_z || name == "zs";
+		has_m = has_m || name == "ms";
+	}
+	if (has_z && has_m) {
+		return GEOARROW_DIMENSIONS_XYZM;
+	}
+	if (has_z) {
+		return GEOARROW_DIMENSIONS_XYZ;
+	}
+	if (has_m) {
+		return GEOARROW_DIMENSIONS_XYM;
+	}
+	return GEOARROW_DIMENSIONS_XY;
 }
 
 // --- Coordinate extraction visitor (WKB → struct) ---
@@ -27,9 +248,13 @@ static LogicalType GeoArrowStructType() {
 struct CoordExtractor {
 	vector<double> xs;
 	vector<double> ys;
+	vector<double> zs;
+	vector<double> ms;
 	vector<int32_t> ring_offsets;
 	vector<int32_t> geom_offsets;
 	uint8_t geometry_type = 0;
+	// Dimensions reported by the outermost geom_start, i.e. what the WKB actually carries
+	enum GeoArrowDimensions dims = GEOARROW_DIMENSIONS_UNKNOWN;
 	int depth = 0;
 };
 
@@ -37,18 +262,21 @@ static int ExtractFeatStart(struct GeoArrowVisitor *v) {
 	auto *ext = static_cast<CoordExtractor *>(v->private_data);
 	ext->xs.clear();
 	ext->ys.clear();
+	ext->zs.clear();
+	ext->ms.clear();
 	ext->ring_offsets.clear();
 	ext->geom_offsets.clear();
 	ext->depth = 0;
 	ext->geometry_type = 0;
+	ext->dims = GEOARROW_DIMENSIONS_UNKNOWN;
 	return GEOARROW_OK;
 }
 
 static int ExtractGeomStart(struct GeoArrowVisitor *v, enum GeoArrowGeometryType type, enum GeoArrowDimensions dims) {
-	(void)dims;
 	auto *ext = static_cast<CoordExtractor *>(v->private_data);
 	if (ext->depth == 0) {
 		ext->geometry_type = static_cast<uint8_t>(type);
+		ext->dims = dims;
 	}
 	ext->depth++;
 	return GEOARROW_OK;
@@ -61,9 +289,22 @@ static int ExtractRingStart(struct GeoArrowVisitor *v) {
 
 static int ExtractCoords(struct GeoArrowVisitor *v, const struct GeoArrowCoordView *coords) {
 	auto *ext = static_cast<CoordExtractor *>(v->private_data);
+	// In an XYM coordinate view the third ordinate is m, not z
+	bool third_is_m = ext->dims == GEOARROW_DIMENSIONS_XYM;
 	for (int64_t i = 0; i < coords->n_coords; i++) {
 		ext->xs.push_back(GEOARROW_COORD_VIEW_VALUE(coords, i, 0));
 		ext->ys.push_back(GEOARROW_COORD_VIEW_VALUE(coords, i, 1));
+		if (coords->n_values > 2) {
+			auto third = GEOARROW_COORD_VIEW_VALUE(coords, i, 2);
+			if (third_is_m) {
+				ext->ms.push_back(third);
+			} else {
+				ext->zs.push_back(third);
+			}
+		}
+		if (coords->n_values > 3) {
+			ext->ms.push_back(GEOARROW_COORD_VIEW_VALUE(coords, i, 3));
+		}
 	}
 	return GEOARROW_OK;
 }
@@ -148,31 +389,117 @@ static void InitExtractVisitor(struct GeoArrowVisitor &visitor, CoordExtractor &
 	visitor.private_data = &extractor;
 }
 
+// Bind data for the write side: which dimensions the output carries.
+struct DimensionsBindData : public FunctionData {
+	explicit DimensionsBindData(enum GeoArrowDimensions dims_p) : dims(dims_p) {
+	}
+
+	enum GeoArrowDimensions dims;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<DimensionsBindData>(dims);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		return dims == other_p.Cast<DimensionsBindData>().dims;
+	}
+};
+
+// Read the optional constant dimensions argument, defaulting to XY.
+static enum GeoArrowDimensions BindDimensionsArgument(ClientContext &context, ScalarFunction &bound_function,
+                                                      vector<unique_ptr<Expression>> &arguments, idx_t arg_index) {
+	if (arguments.size() <= arg_index) {
+		return GEOARROW_DIMENSIONS_XY;
+	}
+	if (!arguments[arg_index]->IsFoldable()) {
+		throw BinderException(bound_function.name + ": the dimensions must be a constant string");
+	}
+	auto value = ExpressionExecutor::EvaluateScalar(context, *arguments[arg_index]);
+	if (value.IsNull()) {
+		throw BinderException(bound_function.name + ": the dimensions must not be NULL");
+	}
+	auto name = value.ToString();
+	enum GeoArrowDimensions dims;
+	if (!ParseDimensionName(name, dims)) {
+		throw BinderException(bound_function.name + ": unknown dimensions '" + name +
+		                      "' (expected xy, xyz, xym or xyzm)");
+	}
+	return dims;
+}
+
+// Verify a feature actually carries the ordinates the caller asked for. Projecting XYZ down
+// to XY is fine; inventing a z for XY data is not.
+static void CheckFeatureDimensions(const CoordExtractor &extractor, enum GeoArrowDimensions wanted,
+                                   const char *fn_name) {
+	bool has_z = extractor.dims == GEOARROW_DIMENSIONS_XYZ || extractor.dims == GEOARROW_DIMENSIONS_XYZM;
+	bool has_m = extractor.dims == GEOARROW_DIMENSIONS_XYM || extractor.dims == GEOARROW_DIMENSIONS_XYZM;
+	bool want_z = wanted == GEOARROW_DIMENSIONS_XYZ || wanted == GEOARROW_DIMENSIONS_XYZM;
+	bool want_m = wanted == GEOARROW_DIMENSIONS_XYM || wanted == GEOARROW_DIMENSIONS_XYZM;
+	if ((want_z && !has_z) || (want_m && !has_m)) {
+		throw InvalidInputException(string(fn_name) + ": geometry is " +
+		                            string(GeoArrowDimensionsString(extractor.dims)) + " but " +
+		                            string(GeoArrowDimensionsString(wanted)) + " was requested");
+	}
+}
+
+// Locate a named child of a STRUCT vector, or nullptr if it has no such field.
+static optional_ptr<Vector> StructChild(Vector &struct_vec, const char *name) {
+	auto &child_types = StructType::GetChildTypes(struct_vec.GetType());
+	auto &children = StructVector::GetEntries(struct_vec);
+	for (idx_t c = 0; c < child_types.size(); c++) {
+		if (StringUtil::Lower(child_types[c].first) == name) {
+			return children[c].get();
+		}
+	}
+	return nullptr;
+}
+
 // Helper: write extractor results into the output STRUCT vectors for row i
 static void WriteExtractorOutput(CoordExtractor &extractor, Vector &result, idx_t i) {
-	auto &children = StructVector::GetEntries(result);
-	FlatVector::GetData<uint8_t>(*children[0])[i] = extractor.geometry_type;
-	SetDoubleList(*children[1], i, extractor.xs);
-	SetDoubleList(*children[2], i, extractor.ys);
-	SetIntList(*children[3], i, extractor.ring_offsets);
-	SetIntList(*children[4], i, extractor.geom_offsets);
+	FlatVector::GetData<uint8_t>(*StructChild(result, "geometry_type"))[i] = extractor.geometry_type;
+	SetDoubleList(*StructChild(result, "xs"), i, extractor.xs);
+	SetDoubleList(*StructChild(result, "ys"), i, extractor.ys);
+	if (auto zs = StructChild(result, "zs")) {
+		SetDoubleList(*zs, i, extractor.zs);
+	}
+	if (auto ms = StructChild(result, "ms")) {
+		SetDoubleList(*ms, i, extractor.ms);
+	}
+	SetIntList(*StructChild(result, "ring_offsets"), i, extractor.ring_offsets);
+	SetIntList(*StructChild(result, "geom_offsets"), i, extractor.geom_offsets);
 }
 
 // Helper: write NULL into the output STRUCT vectors for row i
 static void WriteNullOutput(Vector &result, idx_t i) {
 	FlatVector::Validity(result).SetInvalid(i);
-	auto &children = StructVector::GetEntries(result);
-	FlatVector::GetData<uint8_t>(*children[0])[i] = 0;
-	SetDoubleList(*children[1], i, {});
-	SetDoubleList(*children[2], i, {});
-	SetIntList(*children[3], i, {});
-	SetIntList(*children[4], i, {});
+	FlatVector::GetData<uint8_t>(*StructChild(result, "geometry_type"))[i] = 0;
+	SetDoubleList(*StructChild(result, "xs"), i, {});
+	SetDoubleList(*StructChild(result, "ys"), i, {});
+	if (auto zs = StructChild(result, "zs")) {
+		SetDoubleList(*zs, i, {});
+	}
+	if (auto ms = StructChild(result, "ms")) {
+		SetDoubleList(*ms, i, {});
+	}
+	SetIntList(*StructChild(result, "ring_offsets"), i, {});
+	SetIntList(*StructChild(result, "geom_offsets"), i, {});
 }
 
 // --- st_asgeoarrow: WKB (BLOB/GEOMETRY) → GeoArrow STRUCT ---
 
+// st_asgeoarrow(geom[, dimensions]): the output struct gains zs / ms fields when the
+// caller asks for them, so the one-argument form keeps its original XY type.
+static unique_ptr<FunctionData> StAsGeoArrowBind(ClientContext &context, ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	auto dims = BindDimensionsArgument(context, bound_function, arguments, 1);
+	bound_function.return_type = GeoArrowStructType(dims);
+	return make_uniq<DimensionsBindData>(dims);
+}
+
 static void StAsGeoArrowWKBFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
+
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto wanted_dims = func_expr.bind_info->Cast<DimensionsBindData>().dims;
 
 	UnifiedVectorFormat input_data;
 	args.data[0].ToUnifiedFormat(count, input_data);
@@ -211,6 +538,7 @@ static void StAsGeoArrowWKBFun(DataChunk &args, ExpressionState &state, Vector &
 		}
 		visitor.feat_end(&visitor);
 
+		CheckFeatureDimensions(extractor, wanted_dims, "st_asgeoarrow");
 		WriteExtractorOutput(extractor, result, i);
 	}
 
@@ -283,30 +611,47 @@ static void ExportVectorToArrow(Vector &input, idx_t count, ArrowArrayGuard &out
 
 // --- st_geomfromgeoarrow: GeoArrow STRUCT → WKB BLOB ---
 
-// Helper: build a GeoArrowCoordView from separated x/y arrays
-static struct GeoArrowCoordView MakeCoordView(const double *xs, const double *ys, int64_t n) {
+// A view of one feature's separated coordinate arrays.
+struct CoordArrays {
+	const double *xs = nullptr;
+	const double *ys = nullptr;
+	const double *zs = nullptr;
+	const double *ms = nullptr;
+	idx_t count = 0;
+	enum GeoArrowDimensions dims = GEOARROW_DIMENSIONS_XY;
+};
+
+// Build a GeoArrowCoordView over `n` coordinates starting at `offset`. geoarrow orders the
+// ordinates x, y, [z], [m] - for XYM the third slot holds m.
+static struct GeoArrowCoordView MakeCoordView(const CoordArrays &coords, idx_t offset, idx_t n) {
 	struct GeoArrowCoordView cv;
 	memset(&cv, 0, sizeof(cv));
-	cv.values[0] = xs;
-	cv.values[1] = ys;
-	cv.n_coords = n;
-	cv.n_values = 2;
+	cv.values[0] = coords.xs + offset;
+	cv.values[1] = coords.ys + offset;
+	int32_t n_values = 2;
+	if (coords.dims == GEOARROW_DIMENSIONS_XYZ || coords.dims == GEOARROW_DIMENSIONS_XYZM) {
+		cv.values[n_values++] = coords.zs + offset;
+	}
+	if (coords.dims == GEOARROW_DIMENSIONS_XYM || coords.dims == GEOARROW_DIMENSIONS_XYZM) {
+		cv.values[n_values++] = coords.ms + offset;
+	}
+	cv.n_coords = static_cast<int64_t>(n);
+	cv.n_values = n_values;
 	cv.coords_stride = 1;
 	return cv;
 }
 
 // Drive visitor callbacks to produce WKB from extracted coordinate data
-static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const double *xs, const double *ys,
-                         idx_t num_coords, const int32_t *ring_offs, idx_t num_ring_offs, const int32_t *geom_offs,
-                         idx_t num_geom_offs) {
+static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const CoordArrays &coords,
+                         const int32_t *ring_offs, idx_t num_ring_offs, const int32_t *geom_offs, idx_t num_geom_offs) {
 	auto gt = static_cast<enum GeoArrowGeometryType>(geom_type);
-	auto dims = GEOARROW_DIMENSIONS_XY;
+	auto dims = coords.dims;
 
 	switch (gt) {
 	case GEOARROW_GEOMETRY_TYPE_POINT:
 	case GEOARROW_GEOMETRY_TYPE_LINESTRING: {
 		v->geom_start(v, gt, dims);
-		auto cv = MakeCoordView(xs, ys, static_cast<int64_t>(num_coords));
+		auto cv = MakeCoordView(coords, 0, coords.count);
 		v->coords(v, &cv);
 		v->geom_end(v);
 		break;
@@ -317,7 +662,7 @@ static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const dou
 		for (idx_t r = 0; r < num_ring_offs; r++) {
 			v->ring_start(v);
 			int32_t ring_end = ring_offs[r];
-			auto cv = MakeCoordView(xs + prev, ys + prev, ring_end - prev);
+			auto cv = MakeCoordView(coords, static_cast<idx_t>(prev), static_cast<idx_t>(ring_end - prev));
 			v->coords(v, &cv);
 			v->ring_end(v);
 			prev = ring_end;
@@ -325,27 +670,16 @@ static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const dou
 		v->geom_end(v);
 		break;
 	}
-	case GEOARROW_GEOMETRY_TYPE_MULTIPOINT: {
-		v->geom_start(v, gt, dims);
-		int32_t prev = 0;
-		for (idx_t r = 0; r < num_ring_offs; r++) {
-			v->geom_start(v, GEOARROW_GEOMETRY_TYPE_POINT, dims);
-			int32_t seg_end = ring_offs[r];
-			auto cv = MakeCoordView(xs + prev, ys + prev, seg_end - prev);
-			v->coords(v, &cv);
-			v->geom_end(v);
-			prev = seg_end;
-		}
-		v->geom_end(v);
-		break;
-	}
+	case GEOARROW_GEOMETRY_TYPE_MULTIPOINT:
 	case GEOARROW_GEOMETRY_TYPE_MULTILINESTRING: {
+		auto part_type =
+		    gt == GEOARROW_GEOMETRY_TYPE_MULTIPOINT ? GEOARROW_GEOMETRY_TYPE_POINT : GEOARROW_GEOMETRY_TYPE_LINESTRING;
 		v->geom_start(v, gt, dims);
 		int32_t prev = 0;
 		for (idx_t r = 0; r < num_ring_offs; r++) {
-			v->geom_start(v, GEOARROW_GEOMETRY_TYPE_LINESTRING, dims);
+			v->geom_start(v, part_type, dims);
 			int32_t seg_end = ring_offs[r];
-			auto cv = MakeCoordView(xs + prev, ys + prev, seg_end - prev);
+			auto cv = MakeCoordView(coords, static_cast<idx_t>(prev), static_cast<idx_t>(seg_end - prev));
 			v->coords(v, &cv);
 			v->geom_end(v);
 			prev = seg_end;
@@ -363,7 +697,8 @@ static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const dou
 			for (int32_t r = ring_prev; r < ring_end_idx; r++) {
 				v->ring_start(v);
 				int32_t coord_end = ring_offs[r];
-				auto cv = MakeCoordView(xs + coord_prev, ys + coord_prev, coord_end - coord_prev);
+				auto cv =
+				    MakeCoordView(coords, static_cast<idx_t>(coord_prev), static_cast<idx_t>(coord_end - coord_prev));
 				v->coords(v, &cv);
 				v->ring_end(v);
 				coord_prev = coord_end;
@@ -379,6 +714,13 @@ static void DriveVisitor(struct GeoArrowVisitor *v, uint8_t geom_type, const dou
 	}
 }
 
+// Read a LIST(DOUBLE) child of the flat struct for one row.
+static const double *FlatDoubleList(Vector &list_vec, idx_t row, idx_t &length) {
+	auto entry = FlatVector::GetData<list_entry_t>(list_vec)[row];
+	length = entry.length;
+	return FlatVector::GetData<double>(ListVector::GetEntry(list_vec)) + entry.offset;
+}
+
 static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
 	if (count == 0) {
@@ -390,12 +732,35 @@ static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vecto
 	auto &input = args.data[0];
 	input.Flatten(count);
 
+	auto dims = DimensionsFromFlatStruct(input.GetType());
+	auto &child_names = StructType::GetChildTypes(input.GetType());
 	auto &in_children = StructVector::GetEntries(input);
-	auto &type_vec = *in_children[0];
-	auto &xs_vec = *in_children[1];
-	auto &ys_vec = *in_children[2];
-	auto &ring_off_vec = *in_children[3];
-	auto &geom_off_vec = *in_children[4];
+
+	// Locate children by name so field order does not matter
+	optional_ptr<Vector> type_vec, xs_vec, ys_vec, zs_vec, ms_vec, ring_off_vec, geom_off_vec;
+	for (idx_t c = 0; c < child_names.size(); c++) {
+		auto name = StringUtil::Lower(child_names[c].first);
+		auto &vec = *in_children[c];
+		if (name == "geometry_type") {
+			type_vec = &vec;
+		} else if (name == "xs") {
+			xs_vec = &vec;
+		} else if (name == "ys") {
+			ys_vec = &vec;
+		} else if (name == "zs") {
+			zs_vec = &vec;
+		} else if (name == "ms") {
+			ms_vec = &vec;
+		} else if (name == "ring_offsets") {
+			ring_off_vec = &vec;
+		} else if (name == "geom_offsets") {
+			geom_off_vec = &vec;
+		}
+	}
+	if (!type_vec || !xs_vec || !ys_vec || !ring_off_vec || !geom_off_vec) {
+		throw InvalidInputException("st_geomfromgeoarrow: input struct must have geometry_type, xs, ys, "
+		                            "ring_offsets and geom_offsets fields");
+	}
 	auto &input_validity = FlatVector::Validity(input);
 
 	// One writer for the whole chunk; null rows become null features.
@@ -415,22 +780,41 @@ static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vecto
 			continue;
 		}
 
-		uint8_t geom_type = FlatVector::GetData<uint8_t>(type_vec)[i];
+		uint8_t geom_type = FlatVector::GetData<uint8_t>(*type_vec)[i];
 
-		auto xs_entry = FlatVector::GetData<list_entry_t>(xs_vec)[i];
-		auto xs_data = FlatVector::GetData<double>(ListVector::GetEntry(xs_vec)) + xs_entry.offset;
+		CoordArrays coords;
+		coords.dims = dims;
+		idx_t ys_len = 0;
+		coords.xs = FlatDoubleList(*xs_vec, i, coords.count);
+		coords.ys = FlatDoubleList(*ys_vec, i, ys_len);
+		if (zs_vec) {
+			idx_t zs_len = 0;
+			coords.zs = FlatDoubleList(*zs_vec, i, zs_len);
+			if (zs_len < coords.count) {
+				throw InvalidInputException("st_geomfromgeoarrow: zs has %llu values but xs has %llu",
+				                            static_cast<uint64_t>(zs_len), static_cast<uint64_t>(coords.count));
+			}
+		}
+		if (ms_vec) {
+			idx_t ms_len = 0;
+			coords.ms = FlatDoubleList(*ms_vec, i, ms_len);
+			if (ms_len < coords.count) {
+				throw InvalidInputException("st_geomfromgeoarrow: ms has %llu values but xs has %llu",
+				                            static_cast<uint64_t>(ms_len), static_cast<uint64_t>(coords.count));
+			}
+		}
+		if (ys_len < coords.count) {
+			throw InvalidInputException("st_geomfromgeoarrow: ys has %llu values but xs has %llu",
+			                            static_cast<uint64_t>(ys_len), static_cast<uint64_t>(coords.count));
+		}
 
-		auto ys_entry = FlatVector::GetData<list_entry_t>(ys_vec)[i];
-		auto ys_data = FlatVector::GetData<double>(ListVector::GetEntry(ys_vec)) + ys_entry.offset;
+		auto ro_entry = FlatVector::GetData<list_entry_t>(*ring_off_vec)[i];
+		auto ro_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(*ring_off_vec)) + ro_entry.offset;
 
-		auto ro_entry = FlatVector::GetData<list_entry_t>(ring_off_vec)[i];
-		auto ro_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(ring_off_vec)) + ro_entry.offset;
+		auto go_entry = FlatVector::GetData<list_entry_t>(*geom_off_vec)[i];
+		auto go_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(*geom_off_vec)) + go_entry.offset;
 
-		auto go_entry = FlatVector::GetData<list_entry_t>(geom_off_vec)[i];
-		auto go_data = FlatVector::GetData<int32_t>(ListVector::GetEntry(geom_off_vec)) + go_entry.offset;
-
-		DriveVisitor(&visitor, geom_type, xs_data, ys_data, xs_entry.length, ro_data, ro_entry.length, go_data,
-		             go_entry.length);
+		DriveVisitor(&visitor, geom_type, coords, ro_data, ro_entry.length, go_data, go_entry.length);
 		visitor.feat_end(&visitor);
 	}
 
@@ -442,30 +826,119 @@ static void StGeomFromGeoArrowFun(DataChunk &args, ExpressionState &state, Vecto
 	WKBArrayToVector(wkb.array, result, count, "st_geomfromgeoarrow");
 }
 
-// --- st_geomfromgeoarrow<type>: GeoArrow native encoding -> GEOMETRY ---
+// --- GeoArrow native encoding -> GEOMETRY ---
 //
-// These are thin wrappers around geoarrow-c. DuckDB exports the input vector through
-// its own Arrow bridge, then GeoArrowArrayViewVisitNative walks it and the WKB writer
-// serializes it. Nesting, offsets, null handling and dimension logic all live in the
-// library; the only code here is the two conversions at the edges.
+// Thin wrappers around geoarrow-c. DuckDB exports the input vector through its own Arrow
+// bridge, then GeoArrowArrayViewVisitNative walks it and the WKB writer serializes it.
+// Nesting, offsets, null handling and dimension logic all live in the library; the only
+// code here is the two conversions at the edges.
+//
+// Two entry points share one implementation:
+//   st_geomfromgeoarrow<type>(value)         - one name per geometry type
+//   st_geomfromgeoarrow('<type>', value)     - generic, type given as a string
+// Both resolve to a single GeoArrowType at bind time. The generic form exists because the
+// DuckDB types collide: LineString and MultiPoint are both LIST(STRUCT(x, y)), as are
+// Polygon and MultiLineString, so a value alone cannot say which it is. Dimensions are
+// inferred from the coordinate struct's fields, so Z/M/ZM need no extra argument.
 
-// GeoArrow native encoding -> GEOMETRY. GA_TYPE selects the encoding geoarrow-c expects;
-// the registered DuckDB input type is its structural equivalent.
-template <enum GeoArrowType GA_TYPE>
-static void StGeomFromNativeFun(DataChunk &args, Vector &result, const char *fn_name) {
+struct NativeReadBindData : public FunctionData {
+	explicit NativeReadBindData(enum GeoArrowType ga_type_p, string fn_name_p)
+	    : ga_type(ga_type_p), fn_name(std::move(fn_name_p)) {
+	}
+
+	enum GeoArrowType ga_type;
+	string fn_name;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<NativeReadBindData>(ga_type, fn_name);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<NativeReadBindData>();
+		return ga_type == other.ga_type && fn_name == other.fn_name;
+	}
+};
+
+// Resolve (geometry type, value type) to a native GeoArrowType, validating that the
+// value's nesting depth matches the geometry type.
+static enum GeoArrowType ResolveNativeType(enum GeoArrowGeometryType geometry_type, const LogicalType &value_type,
+                                           enum GeoArrowDimensions expected_dims, const string &fn_name) {
+	int depth = 0;
+	enum GeoArrowDimensions dims = GEOARROW_DIMENSIONS_UNKNOWN;
+	if (!InspectNativeType(value_type, depth, dims)) {
+		throw BinderException(fn_name + ": " + value_type.ToString() +
+		                      " is not a GeoArrow native encoding (expected a nesting of "
+		                      "STRUCT(x, y), STRUCT(x, y, z), STRUCT(x, y, m) or STRUCT(x, y, z, m))");
+	}
+	auto want_depth = NativeNestingDepth(geometry_type);
+	if (depth != want_depth) {
+		throw BinderException(fn_name + ": " + string(GeoArrowGeometryTypeString(geometry_type)) + " expects " +
+		                      NativeType(geometry_type, dims).ToString() + ", got " + value_type.ToString());
+	}
+	if (expected_dims != GEOARROW_DIMENSIONS_UNKNOWN && expected_dims != dims) {
+		throw BinderException(fn_name + ": type name says " + string(GeoArrowDimensionsString(expected_dims)) +
+		                      " but the value is " + string(GeoArrowDimensionsString(dims)));
+	}
+	auto ga_type = GeoArrowMakeType(geometry_type, dims, GEOARROW_COORD_TYPE_SEPARATE);
+	if (ga_type == GEOARROW_TYPE_UNINITIALIZED) {
+		throw BinderException(fn_name + ": unsupported combination of geometry type and dimensions");
+	}
+	return ga_type;
+}
+
+// Bind for the per-type names: the geometry type is fixed, dimensions come from the value.
+template <enum GeoArrowGeometryType GEOMETRY_TYPE>
+static unique_ptr<FunctionData> NativeReadBind(ClientContext &context, ScalarFunction &bound_function,
+                                               vector<unique_ptr<Expression>> &arguments) {
+	auto ga_type =
+	    ResolveNativeType(GEOMETRY_TYPE, bound_function.arguments[0], GEOARROW_DIMENSIONS_UNKNOWN, bound_function.name);
+	return make_uniq<NativeReadBindData>(ga_type, bound_function.name);
+}
+
+// Bind for the generic form: the geometry type comes from a constant string argument.
+static unique_ptr<FunctionData> GenericNativeReadBind(ClientContext &context, ScalarFunction &bound_function,
+                                                      vector<unique_ptr<Expression>> &arguments) {
+	if (!arguments[0]->IsFoldable()) {
+		throw BinderException(bound_function.name + ": the geometry type must be a constant string");
+	}
+	auto type_value = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+	if (type_value.IsNull()) {
+		throw BinderException(bound_function.name + ": the geometry type must not be NULL");
+	}
+
+	auto type_name = type_value.ToString();
+	enum GeoArrowGeometryType geometry_type;
+	enum GeoArrowDimensions named_dims;
+	if (!ParseGeometryTypeName(type_name, geometry_type, named_dims)) {
+		throw BinderException(bound_function.name + ": unknown geometry type '" + type_name +
+		                      "' (expected point, linestring, polygon, multipoint, multilinestring or "
+		                      "multipolygon, optionally suffixed with z, m or zm)");
+	}
+
+	auto ga_type = ResolveNativeType(geometry_type, bound_function.arguments[1], named_dims, bound_function.name);
+	return make_uniq<NativeReadBindData>(ga_type, bound_function.name);
+}
+
+// Shared execution: the GeoArrowType was resolved at bind time.
+static void StGeomFromNativeFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = args.size();
 	if (count == 0) {
 		return;
 	}
 
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &info = func_expr.bind_info->Cast<NativeReadBindData>();
+	auto fn_name = info.fn_name.c_str();
+	// The generic form takes the type name first; the value is always the last argument
+	auto &input = args.data[args.ColumnCount() - 1];
+
 	ArrowArrayGuard exported;
-	ExportVectorToArrow(args.data[0], count, exported);
+	ExportVectorToArrow(input, count, exported);
 
 	struct GeoArrowError ga_error;
 	memset(&ga_error, 0, sizeof(ga_error));
 
 	struct GeoArrowArrayView view;
-	if (GeoArrowArrayViewInitFromType(&view, GA_TYPE) != GEOARROW_OK) {
+	if (GeoArrowArrayViewInitFromType(&view, info.ga_type) != GEOARROW_OK) {
 		throw InternalException(string(fn_name) + ": GeoArrowArrayViewInitFromType failed");
 	}
 	if (GeoArrowArrayViewSetArray(&view, exported.array.children[0], &ga_error) != GEOARROW_OK) {
@@ -488,30 +961,6 @@ static void StGeomFromNativeFun(DataChunk &args, Vector &result, const char *fn_
 	WKBArrayToVector(wkb.array, result, count, fn_name);
 }
 
-static void StGeomFromGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_POINT>(args, result, "st_geomfromgeoarrowpoint");
-}
-
-static void StGeomFromGeoArrowLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_LINESTRING>(args, result, "st_geomfromgeoarrowlinestring");
-}
-
-static void StGeomFromGeoArrowPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_POLYGON>(args, result, "st_geomfromgeoarrowpolygon");
-}
-
-static void StGeomFromGeoArrowMultiPointFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_MULTIPOINT>(args, result, "st_geomfromgeoarrowmultipoint");
-}
-
-static void StGeomFromGeoArrowMultiLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_MULTILINESTRING>(args, result, "st_geomfromgeoarrowmultilinestring");
-}
-
-static void StGeomFromGeoArrowMultiPolygonFun(DataChunk &args, ExpressionState &state, Vector &result) {
-	StGeomFromNativeFun<GEOARROW_TYPE_MULTIPOLYGON>(args, result, "st_geomfromgeoarrowmultipolygon");
-}
-
 // --- st_asgeoarrowpoint: WKB (BLOB/GEOMETRY) → STRUCT(x DOUBLE, y DOUBLE) ---
 // Matches GeoArrow native encoding for Point: separated coordinates as Struct<x, y>.
 
@@ -531,17 +980,27 @@ static void StAsGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector
 
 	struct GeoArrowError ga_error;
 
-	auto &children = StructVector::GetEntries(result);
-	auto x_data = FlatVector::GetData<double>(*children[0]);
-	auto y_data = FlatVector::GetData<double>(*children[1]);
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto wanted_dims = func_expr.bind_info->Cast<DimensionsBindData>().dims;
+
+	static const char *ordinate_names[] = {"x", "y", "z", "m"};
+	double *ordinate_data[4] = {nullptr, nullptr, nullptr, nullptr};
+	for (idx_t d = 0; d < 4; d++) {
+		if (auto child = StructChild(result, ordinate_names[d])) {
+			ordinate_data[d] = FlatVector::GetData<double>(*child);
+		}
+	}
 	auto &result_validity = FlatVector::Validity(result);
 
 	for (idx_t i = 0; i < count; i++) {
 		auto input_idx = input_data.sel->get_index(i);
 		if (!input_data.validity.RowIsValid(input_idx)) {
 			result_validity.SetInvalid(i);
-			x_data[i] = 0;
-			y_data[i] = 0;
+			for (auto data : ordinate_data) {
+				if (data) {
+					data[i] = 0;
+				}
+			}
 			continue;
 		}
 
@@ -572,8 +1031,13 @@ static void StAsGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector
 			throw InvalidInputException("st_asgeoarrowpoint: POINT must have exactly one coordinate");
 		}
 
-		x_data[i] = extractor.xs[0];
-		y_data[i] = extractor.ys[0];
+		CheckFeatureDimensions(extractor, wanted_dims, "st_asgeoarrowpoint");
+		const vector<double> *sources[] = {&extractor.xs, &extractor.ys, &extractor.zs, &extractor.ms};
+		for (idx_t d = 0; d < 4; d++) {
+			if (ordinate_data[d]) {
+				ordinate_data[d][i] = (*sources[d])[0];
+			}
+		}
 	}
 
 	GeoArrowWKBReaderReset(&wkb_reader);
@@ -583,18 +1047,27 @@ static void StAsGeoArrowPointFun(DataChunk &args, ExpressionState &state, Vector
 
 // Append n (x,y) coords into the STRUCT(x,y) child of `coord_list`.
 // Returns the (offset, length) entry in the coord-struct index space.
-static list_entry_t AppendCoordBlock(Vector &coord_list, const double *xs, const double *ys, idx_t n) {
+static list_entry_t AppendCoordBlock(Vector &coord_list, const CoordExtractor &ext, idx_t offset, idx_t n) {
 	auto current = ListVector::GetListSize(coord_list);
 	auto new_size = current + n;
 	ListVector::Reserve(coord_list, new_size);
 	auto &coord_struct = ListVector::GetEntry(coord_list);
-	auto &coord_children = StructVector::GetEntries(coord_struct);
-	auto x_data = FlatVector::GetData<double>(*coord_children[0]);
-	auto y_data = FlatVector::GetData<double>(*coord_children[1]);
-	for (idx_t k = 0; k < n; k++) {
-		x_data[current + k] = xs[k];
-		y_data[current + k] = ys[k];
+
+	// Copy whichever ordinates the output coordinate struct declares
+	static const char *ordinate_names[] = {"x", "y", "z", "m"};
+	const vector<double> *sources[] = {&ext.xs, &ext.ys, &ext.zs, &ext.ms};
+	for (idx_t d = 0; d < 4; d++) {
+		auto child = StructChild(coord_struct, ordinate_names[d]);
+		if (!child) {
+			continue;
+		}
+		auto data = FlatVector::GetData<double>(*child);
+		auto &src = *sources[d];
+		for (idx_t k = 0; k < n; k++) {
+			data[current + k] = src[offset + k];
+		}
 	}
+
 	ListVector::SetListSize(coord_list, new_size);
 	return list_entry_t {current, n};
 }
@@ -620,7 +1093,7 @@ static void ParseWKBRow(GeoArrowWKBReader &reader, GeoArrowVisitor &visitor, Geo
 // `take_all_as_one_ring` = true for LineString (use xs/ys directly as one list);
 // MultiPoint also flattens to one list of coords, so same logic applies.
 static void WriteListOfCoords(Vector &result, idx_t row, const CoordExtractor &ext) {
-	auto entry = AppendCoordBlock(result, ext.xs.data(), ext.ys.data(), ext.xs.size());
+	auto entry = AppendCoordBlock(result, ext, 0, ext.xs.size());
 	FlatVector::GetData<list_entry_t>(result)[row] = entry;
 }
 
@@ -637,8 +1110,7 @@ static void WriteListOfListOfCoords(Vector &result, idx_t row, const CoordExtrac
 	for (idx_t r = 0; r < num_inner; r++) {
 		int32_t end = ext.ring_offsets[r];
 		int32_t n = end - prev;
-		auto coord_entry =
-		    AppendCoordBlock(inner_list, ext.xs.data() + prev, ext.ys.data() + prev, static_cast<idx_t>(n));
+		auto coord_entry = AppendCoordBlock(inner_list, ext, static_cast<idx_t>(prev), static_cast<idx_t>(n));
 		inner_entries[outer_start + r] = coord_entry;
 		prev = end;
 	}
@@ -668,8 +1140,8 @@ static void WriteMultiPolygon(Vector &result, idx_t row, const CoordExtractor &e
 		for (int32_t r = ring_idx_start; r < ring_idx_end; r++) {
 			int32_t coord_end = ext.ring_offsets[r];
 			int32_t n = coord_end - coord_idx_start;
-			auto coord_entry = AppendCoordBlock(ring_list, ext.xs.data() + coord_idx_start,
-			                                    ext.ys.data() + coord_idx_start, static_cast<idx_t>(n));
+			auto coord_entry =
+			    AppendCoordBlock(ring_list, ext, static_cast<idx_t>(coord_idx_start), static_cast<idx_t>(n));
 			ring_entries[ring_start + (r - ring_idx_start)] = coord_entry;
 			coord_idx_start = coord_end;
 		}
@@ -685,6 +1157,9 @@ static void WriteMultiPolygon(Vector &result, idx_t row, const CoordExtractor &e
 template <enum GeoArrowGeometryType EXPECTED, void (*WRITER)(Vector &, idx_t, const CoordExtractor &)>
 static void StAsGeoArrowNestedFun(DataChunk &args, ExpressionState &state, Vector &result, const char *fn_name) {
 	auto count = args.size();
+
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto wanted_dims = func_expr.bind_info->Cast<DimensionsBindData>().dims;
 
 	UnifiedVectorFormat input_data;
 	args.data[0].ToUnifiedFormat(count, input_data);
@@ -720,11 +1195,36 @@ static void StAsGeoArrowNestedFun(DataChunk &args, ExpressionState &state, Vecto
 			throw InvalidInputException("%s: expected geometry type %d, got %d", fn_name, static_cast<int>(EXPECTED),
 			                            extractor.geometry_type);
 		}
+		try {
+			CheckFeatureDimensions(extractor, wanted_dims, fn_name);
+		} catch (...) {
+			GeoArrowWKBReaderReset(&wkb_reader);
+			throw;
+		}
 
 		WRITER(result, i, extractor);
 	}
 
 	GeoArrowWKBReaderReset(&wkb_reader);
+}
+
+// st_asgeoarrow<type>(geom[, dimensions]): keep the registered nesting depth and swap the
+// coordinate struct for the requested dimensions. Depth alone determines the output shape,
+// so this one bind serves all six geometry types.
+static unique_ptr<FunctionData> StAsGeoArrowNativeBind(ClientContext &context, ScalarFunction &bound_function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	auto dims = BindDimensionsArgument(context, bound_function, arguments, 1);
+	int depth = 0;
+	enum GeoArrowDimensions registered_dims = GEOARROW_DIMENSIONS_UNKNOWN;
+	if (!InspectNativeType(bound_function.return_type, depth, registered_dims)) {
+		throw InternalException("st_asgeoarrow<type>: registered return type is not a native encoding");
+	}
+	auto out = CoordStructType(dims);
+	for (int i = 0; i < depth; i++) {
+		out = LogicalType::LIST(out);
+	}
+	bound_function.return_type = std::move(out);
+	return make_uniq<DimensionsBindData>(dims);
 }
 
 static void StAsGeoArrowLineStringFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -767,60 +1267,92 @@ static void DuckGeoarrowVersionFun(DataChunk &args, ExpressionState &state, Vect
 
 // --- Extension registration ---
 
-static void LoadInternal(ExtensionLoader &loader) {
-	auto geoarrow_struct = GeoArrowStructType();
+// The six GeoArrow geometry types, with the per-type function-name suffix and the bind
+// callback that pins the geometry type for the read direction.
+struct GeometryTypeEntry {
+	enum GeoArrowGeometryType geometry_type;
+	const char *suffix;
+	scalar_function_t write_fn;
+	bind_scalar_function_t read_bind;
+};
 
-	// st_asgeoarrow: accepts GEOMETRY or BLOB (WKB)
+static void LoadInternal(ExtensionLoader &loader) {
+	static const enum GeoArrowDimensions ALL_DIMS[] = {GEOARROW_DIMENSIONS_XY, GEOARROW_DIMENSIONS_XYZ,
+	                                                   GEOARROW_DIMENSIONS_XYM, GEOARROW_DIMENSIONS_XYZM};
+
+	const GeometryTypeEntry types[] = {
+	    {GEOARROW_GEOMETRY_TYPE_POINT, "point", StAsGeoArrowPointFun, NativeReadBind<GEOARROW_GEOMETRY_TYPE_POINT>},
+	    {GEOARROW_GEOMETRY_TYPE_LINESTRING, "linestring", StAsGeoArrowLineStringFun,
+	     NativeReadBind<GEOARROW_GEOMETRY_TYPE_LINESTRING>},
+	    {GEOARROW_GEOMETRY_TYPE_POLYGON, "polygon", StAsGeoArrowPolygonFun,
+	     NativeReadBind<GEOARROW_GEOMETRY_TYPE_POLYGON>},
+	    {GEOARROW_GEOMETRY_TYPE_MULTIPOINT, "multipoint", StAsGeoArrowMultiPointFun,
+	     NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOINT>},
+	    {GEOARROW_GEOMETRY_TYPE_MULTILINESTRING, "multilinestring", StAsGeoArrowMultiLineStringFun,
+	     NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTILINESTRING>},
+	    {GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON, "multipolygon", StAsGeoArrowMultiPolygonFun,
+	     NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON>},
+	};
+
+	// --- st_asgeoarrow(geom[, dimensions]) -> flat GeoArrow STRUCT ---
+	// The return type is computed in the bind, so the one-argument form stays XY.
 	ScalarFunctionSet st_asgeoarrow_set("st_asgeoarrow");
-	st_asgeoarrow_set.AddFunction(ScalarFunction({LogicalType::GEOMETRY()}, geoarrow_struct, StAsGeoArrowWKBFun));
-	st_asgeoarrow_set.AddFunction(ScalarFunction({LogicalType::BLOB}, geoarrow_struct, StAsGeoArrowWKBFun));
+	const vector<LogicalType> wkb_inputs = {LogicalType::GEOMETRY(), LogicalType::BLOB};
+	for (auto &input : wkb_inputs) {
+		st_asgeoarrow_set.AddFunction(
+		    ScalarFunction({input}, GeoArrowStructType(), StAsGeoArrowWKBFun, StAsGeoArrowBind));
+		st_asgeoarrow_set.AddFunction(
+		    ScalarFunction({input, LogicalType::VARCHAR}, GeoArrowStructType(), StAsGeoArrowWKBFun, StAsGeoArrowBind));
+	}
 	loader.RegisterFunction(st_asgeoarrow_set);
 
-	// st_geomfromgeoarrow: GeoArrow STRUCT → GEOMETRY
-	auto st_geomfromgeoarrow_func =
-	    ScalarFunction("st_geomfromgeoarrow", {geoarrow_struct}, LogicalType::GEOMETRY(), StGeomFromGeoArrowFun);
-	loader.RegisterFunction(st_geomfromgeoarrow_func);
+	// --- st_geomfromgeoarrow(...) -> GEOMETRY ---
+	// Three shapes share one name:
+	//   (flat struct)              the original flat representation, any dimensions
+	//   ('<type>', native value)   generic native reader, the form asked for in issue #7
+	ScalarFunctionSet st_geomfromgeoarrow_set("st_geomfromgeoarrow");
+	for (auto dims : ALL_DIMS) {
+		st_geomfromgeoarrow_set.AddFunction(
+		    ScalarFunction({GeoArrowStructType(dims)}, LogicalType::GEOMETRY(), StGeomFromGeoArrowFun));
+	}
+	// One signature per (nesting depth, dimensions); the type name argument picks which
+	// geometry type a given shape means, since e.g. LineString and MultiPoint collide.
+	for (auto dims : ALL_DIMS) {
+		auto native = CoordStructType(dims);
+		for (int depth = 0; depth <= 3; depth++) {
+			st_geomfromgeoarrow_set.AddFunction(ScalarFunction({LogicalType::VARCHAR, native}, LogicalType::GEOMETRY(),
+			                                                   StGeomFromNativeFun, GenericNativeReadBind));
+			native = LogicalType::LIST(native);
+		}
+	}
+	loader.RegisterFunction(st_geomfromgeoarrow_set);
 
-	// GeoArrow native-encoding output types (separated coords per spec):
+	// --- st_asgeoarrow<type>(geom[, dimensions]) and st_geomfromgeoarrow<type>(value) ---
+	// GeoArrow native encodings, separated coordinates per the spec:
 	//   Point           → STRUCT(x, y)
 	//   LineString      → LIST(STRUCT(x, y))
 	//   Polygon         → LIST(LIST(STRUCT(x, y)))
 	//   MultiPoint      → LIST(STRUCT(x, y))
 	//   MultiLineString → LIST(LIST(STRUCT(x, y)))
 	//   MultiPolygon    → LIST(LIST(LIST(STRUCT(x, y))))
-	auto coord_type = LogicalType::STRUCT({{"x", LogicalType::DOUBLE}, {"y", LogicalType::DOUBLE}});
-	auto linestring_type = LogicalType::LIST(coord_type);
-	auto polygon_type = LogicalType::LIST(linestring_type);
-	auto multipoint_type = LogicalType::LIST(coord_type);
-	auto multilinestring_type = LogicalType::LIST(linestring_type);
-	auto multipolygon_type = LogicalType::LIST(polygon_type);
+	// with z / m ordinates added to the coordinate struct for the other dimensions.
+	for (auto &entry : types) {
+		ScalarFunctionSet write_set(string("st_asgeoarrow") + entry.suffix);
+		for (auto &input : wkb_inputs) {
+			auto xy_out = NativeType(entry.geometry_type, GEOARROW_DIMENSIONS_XY);
+			write_set.AddFunction(ScalarFunction({input}, xy_out, entry.write_fn, StAsGeoArrowNativeBind));
+			write_set.AddFunction(
+			    ScalarFunction({input, LogicalType::VARCHAR}, xy_out, entry.write_fn, StAsGeoArrowNativeBind));
+		}
+		loader.RegisterFunction(write_set);
 
-	auto register_native = [&](const char *name, const LogicalType &out, scalar_function_t fn) {
-		ScalarFunctionSet set(name);
-		set.AddFunction(ScalarFunction({LogicalType::GEOMETRY()}, out, fn));
-		set.AddFunction(ScalarFunction({LogicalType::BLOB}, out, fn));
-		loader.RegisterFunction(set);
-	};
-	register_native("st_asgeoarrowpoint", coord_type, StAsGeoArrowPointFun);
-	register_native("st_asgeoarrowlinestring", linestring_type, StAsGeoArrowLineStringFun);
-	register_native("st_asgeoarrowpolygon", polygon_type, StAsGeoArrowPolygonFun);
-	register_native("st_asgeoarrowmultipoint", multipoint_type, StAsGeoArrowMultiPointFun);
-	register_native("st_asgeoarrowmultilinestring", multilinestring_type, StAsGeoArrowMultiLineStringFun);
-	register_native("st_asgeoarrowmultipolygon", multipolygon_type, StAsGeoArrowMultiPolygonFun);
-
-	// GeoArrow native encoding → GEOMETRY. One name per geometry type: LineString and
-	// MultiPoint share the DuckDB type LIST(STRUCT(x, y)) (as do Polygon and
-	// MultiLineString), so they cannot be overloads of a single function.
-	auto register_from_native = [&](const char *name, const LogicalType &in, scalar_function_t fn) {
-		loader.RegisterFunction(ScalarFunction(name, {in}, LogicalType::GEOMETRY(), fn));
-	};
-	register_from_native("st_geomfromgeoarrowpoint", coord_type, StGeomFromGeoArrowPointFun);
-	register_from_native("st_geomfromgeoarrowlinestring", linestring_type, StGeomFromGeoArrowLineStringFun);
-	register_from_native("st_geomfromgeoarrowpolygon", polygon_type, StGeomFromGeoArrowPolygonFun);
-	register_from_native("st_geomfromgeoarrowmultipoint", multipoint_type, StGeomFromGeoArrowMultiPointFun);
-	register_from_native("st_geomfromgeoarrowmultilinestring", multilinestring_type,
-	                     StGeomFromGeoArrowMultiLineStringFun);
-	register_from_native("st_geomfromgeoarrowmultipolygon", multipolygon_type, StGeomFromGeoArrowMultiPolygonFun);
+		ScalarFunctionSet read_set(string("st_geomfromgeoarrow") + entry.suffix);
+		for (auto dims : ALL_DIMS) {
+			read_set.AddFunction(ScalarFunction({NativeType(entry.geometry_type, dims)}, LogicalType::GEOMETRY(),
+			                                    StGeomFromNativeFun, entry.read_bind));
+		}
+		loader.RegisterFunction(read_set);
+	}
 
 	// duck_geoarrow_version: returns version info
 	auto version_func = ScalarFunction("duck_geoarrow_version", {}, LogicalType::VARCHAR, DuckGeoarrowVersionFun);

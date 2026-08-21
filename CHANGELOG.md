@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/am2222/duck_geoarrow/compare/v0.1.2...v0.1.3) (2026-08-21)
+
+
+### Bug Fixes
+
+* improve error message formatting in WKBArrayToVector and update register_native function signature ([bca85b3](https://github.com/am2222/duck_geoarrow/commit/bca85b39b8c46c5ae8de32959ff69cf92aed6781))
+
 ## [0.1.2](https://github.com/am2222/duck_geoarrow/compare/v0.1.1...v0.1.2) (2026-04-15)
 
 

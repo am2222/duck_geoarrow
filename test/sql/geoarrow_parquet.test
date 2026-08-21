@@ -1,0 +1,115 @@
+# name: test/sql/geoarrow_parquet.test
+# description: read a real GeoArrow-encoded GeoParquet file written by geopandas
+# group: [sql]
+
+require duck_geoarrow
+
+require parquet
+
+# test/data/ms_counties.parquet was written by geopandas with encoding="polygon", i.e.
+# GeoArrow native separated coordinates. See test/data/README.md for provenance.
+
+# The GeoArrow polygon encoding arrives as LIST(LIST(STRUCT(x, y)))
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT geometry FROM 'test/data/ms_counties.parquet');
+----
+geometry	STRUCT(x DOUBLE, y DOUBLE)[][]
+
+# Every county converts, none silently becomes NULL
+query III
+SELECT count(*),
+       count(st_geomfromgeoarrowpolygon(geometry)),
+       count(*) FILTER (WHERE st_geomfromgeoarrowpolygon(geometry) IS NULL)
+FROM 'test/data/ms_counties.parquet';
+----
+82	82	0
+
+# Every row comes back as a POLYGON (st_geometrytype lives in the spatial extension,
+# so check the WKT tag instead)
+query I
+SELECT count(*) FROM 'test/data/ms_counties.parquet'
+WHERE st_geomfromgeoarrowpolygon(geometry)::VARCHAR NOT LIKE 'POLYGON %';
+----
+0
+
+# Stable spot-check of the actual coordinates
+query III
+SELECT county_name, geoid, substr(st_geomfromgeoarrowpolygon(geometry)::VARCHAR, 1, 40)
+FROM 'test/data/ms_counties.parquet' ORDER BY county_name LIMIT 3;
+----
+Adams	28001	POLYGON ((-91.36527433451344 31.33615576
+Alcorn	28003	POLYGON ((-88.82305087860139 34.99522088
+Amite	28005	POLYGON ((-90.5476171077349 30.999715510
+
+# Vertex counts survive the trip: the ring read out of GEOMETRY has as many
+# coordinates as the ring in the file
+query I
+SELECT count(*) FROM 'test/data/ms_counties.parquet'
+WHERE len(st_asgeoarrowpolygon(st_geomfromgeoarrowpolygon(geometry))[1]) <> len(geometry[1]);
+----
+0
+
+query II
+SELECT sum(len(geometry[1])), max(len(geometry)) FROM 'test/data/ms_counties.parquet';
+----
+6957	1
+
+# GeoArrow → GEOMETRY → GeoArrow is an exact identity on all 82 rows, compared as
+# nested values rather than as text
+query I
+SELECT count(*) FROM 'test/data/ms_counties.parquet'
+WHERE geometry <> st_asgeoarrowpolygon(st_geomfromgeoarrowpolygon(geometry));
+----
+0
+
+# The geometry we read agrees with the bbox geopandas computed independently and
+# stored in a separate column (float32, hence the tolerance)
+query II
+WITH conv AS (
+  SELECT geometry_bbox,
+         st_asgeoarrowpolygon(st_geomfromgeoarrowpolygon(geometry))[1] AS ring
+  FROM 'test/data/ms_counties.parquet'
+), ext AS (
+  SELECT geometry_bbox,
+         (SELECT min(c.x) FROM unnest(ring) AS u(c)) AS xmin,
+         (SELECT max(c.x) FROM unnest(ring) AS u(c)) AS xmax,
+         (SELECT min(c.y) FROM unnest(ring) AS u(c)) AS ymin,
+         (SELECT max(c.y) FROM unnest(ring) AS u(c)) AS ymax
+  FROM conv
+)
+SELECT count(*),
+       count(*) FILTER (
+         WHERE abs(xmin - geometry_bbox.xmin) < 1e-4 AND abs(xmax - geometry_bbox.xmax) < 1e-4
+           AND abs(ymin - geometry_bbox.ymin) < 1e-4 AND abs(ymax - geometry_bbox.ymax) < 1e-4
+       )
+FROM ext;
+----
+82	82
+
+# A filtered scan hands the function a vector with a selection vector applied
+query II
+SELECT count(*), count(DISTINCT st_geomfromgeoarrowpolygon(geometry)::VARCHAR)
+FROM 'test/data/ms_counties.parquet' WHERE county_name LIKE 'A%';
+----
+4	4
+
+# Crossing multiple chunks (82 x 60 = 4920 rows)
+query II
+SELECT count(*), count(st_geomfromgeoarrowpolygon(geometry))
+FROM 'test/data/ms_counties.parquet', range(60);
+----
+4920	4920
+
+# The file also round-trips through the flat struct representation
+query I
+SELECT count(*) FROM 'test/data/ms_counties.parquet'
+WHERE st_geomfromgeoarrow(st_asgeoarrow(st_geomfromgeoarrowpolygon(geometry)))::VARCHAR
+   <> st_geomfromgeoarrowpolygon(geometry)::VARCHAR;
+----
+0
+
+# Feeding the column to the wrong reader is a bind-time error, not a crash
+statement error
+SELECT st_geomfromgeoarrowmultipolygon(geometry) FROM 'test/data/ms_counties.parquet';
+----
+No function matches the given name and argument types

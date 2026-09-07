@@ -1,7 +1,7 @@
 extension:
   name: duck_geoarrow
-  description: DuckDB extension for converting GEOMETRY/WKB to and from GeoArrow native encodings, powered by geoarrow-c. Built against DuckDB v1.5.2.
-  version: 0.1.0
+  description: DuckDB extension for converting GEOMETRY/WKB to and from GeoArrow native encodings, powered by geoarrow-c.
+  version: 0.1.3 # x-release-please-version
   language: C++
   build: cmake
   license: MIT
@@ -10,7 +10,7 @@ extension:
 
 repo:
   github: am2222/duck_geoarrow
-  ref: 3d0e6c597842753591633173826446b50f35b2b3
+  ref: 954939b3ebcbbcaf07f6a521e519964bbc7770e0
 
 docs:
   hello_world: |

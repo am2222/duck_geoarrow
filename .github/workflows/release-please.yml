@@ -13,12 +13,108 @@ permissions:
   contents: write
   pull-requests: write
 
+# RELEASE_PAT is a classic personal access token with the `public_repo` scope. It is
+# needed for two reasons:
+#   1. Tags and releases created with the default GITHUB_TOKEN do not trigger other
+#      workflows, so the tag-triggered release job in MainDistributionPipeline.yml
+#      never ran (v0.1.3 shipped without binaries). A PAT-created tag does trigger it.
+#   2. Pushing to the community-extensions fork and opening the upstream PR both need
+#      access outside this repository.
+# Until the secret exists, release-please falls back to GITHUB_TOKEN and the
+# community-extensions job is skipped.
+
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+  # Open a PR against duckdb/community-extensions pointing at the new release. Runs in
+  # the same workflow run as release-please (rather than on a `release:` trigger) so it
+  # works regardless of which token created the release.
+  community-extensions-pr:
+    name: Open community-extensions PR
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+      UPSTREAM: duckdb/community-extensions
+      FORK: am2222/community-extensions
+      EXT_NAME: duck_geoarrow
+      VERSION: ${{ needs.release-please.outputs.version }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+      SHA: ${{ needs.release-please.outputs.sha }}
+    steps:
+      - name: Check for RELEASE_PAT
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::RELEASE_PAT secret is not set; cannot push to $FORK or open a PR on $UPSTREAM."
+            exit 1
+          fi
+
+      # This repo's description.yml is the source of truth for the listing; only
+      # repo.ref is stamped with the release commit.
+      - name: Check out the released commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+          path: source
+
+      - name: Check out community-extensions
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: main
+          path: community-extensions
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Update description.yml
+        working-directory: community-extensions
+        run: |
+          target="extensions/$EXT_NAME/description.yml"
+          sed -E "s|^([[:space:]]*ref:).*|\1 $SHA|" "../source/description.yml" > "$target"
+          grep -q "ref: $SHA" "$target"
+          grep -q "version: $VERSION" "$target" || {
+            echo "::error::description.yml does not carry version $VERSION; check the x-release-please-version marker"
+            exit 1
+          }
+          git --no-pager diff -- "$target"
+
+      - name: Push branch to fork and open PR
+        working-directory: community-extensions
+        run: |
+          gh auth setup-git
+          branch="$EXT_NAME-$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "extensions/$EXT_NAME/description.yml"
+          git commit -m "Update $EXT_NAME to $TAG"
+          git push --force "https://github.com/$FORK.git" "HEAD:$branch"
+
+          # `gh pr list --head` takes the bare branch name; `gh pr create --head` wants owner:branch.
+          existing=$(gh pr list --repo "$UPSTREAM" --head "$branch" --state open --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $branch; branch updated."
+            exit 0
+          fi
+          gh pr create --repo "$UPSTREAM" --head "${FORK%%/*}:$branch" --base main \
+            --title "Update $EXT_NAME to $TAG" \
+            --body "Bumps \`$EXT_NAME\` to $TAG (\`$SHA\`).
+
+          Release notes: https://github.com/${{ github.repository }}/releases/tag/$TAG
+
+          Opened automatically by the release workflow in ${{ github.repository }}."

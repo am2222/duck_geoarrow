@@ -5,7 +5,8 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
-        "CMakeLists.txt"
+        "CMakeLists.txt",
+        { "type": "generic", "path": "description.yml" }
       ]
     }
   }

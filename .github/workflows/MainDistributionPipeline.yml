@@ -29,6 +29,19 @@ jobs:
       extension_name: duck_geoarrow
       format_checks: 'format;tidy'
 
+  # Canary build against the upcoming DuckDB v2. community-extensions builds every
+  # extension against this same branch (see its build_next.yml), so a failure here is
+  # one that would show up there. Artifacts get a postfix so the release job below can
+  # tell them apart from the v1.5.5 binaries and leave them out of the GitHub release.
+  duckdb-next-build:
+    name: Build extension binaries (DuckDB v2 canary)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
+      extension_name: duck_geoarrow
+      artifact_postfix: -duckdb-next
+
   release:
     name: Publish release
     needs: duckdb-stable-build
@@ -43,13 +56,15 @@ jobs:
         with:
           path: raw-artifacts
 
-      # Each artifact dir is named  duck_geoarrow-1.5.1-extension-<platform>
+      # Each artifact dir is named  duck_geoarrow-v1.5.5-extension-<platform>
       # and contains  build/release/extension/duck_geoarrow/duck_geoarrow.duckdb_extension
       # Flatten & rename to  duck_geoarrow-<platform>.duckdb_extension for the release.
+      # The v2 canary's artifacts end in -duckdb-next and are not released.
       - name: Collect and rename extension binaries
         run: |
           mkdir -p dist
           for artifact_dir in raw-artifacts/duck_geoarrow-*-extension-*/; do
+            case "$artifact_dir" in *-duckdb-next/) continue ;; esac
             platform=$(basename "$artifact_dir" | sed 's/duck_geoarrow-[^-]*-extension-//')
             src=$(find "$artifact_dir" -name "duck_geoarrow.duckdb_extension" | head -1)
             if [ -n "$src" ]; then

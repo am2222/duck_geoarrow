@@ -85,8 +85,15 @@ jobs:
         working-directory: community-extensions
         run: |
           target="extensions/$EXT_NAME/description.yml"
-          sed -E "s|^([[:space:]]*ref:).*|\1 $SHA|" "../source/description.yml" > "$target"
+          # Stamp both ref and ref_next. ref_next is what makes the upstream
+          # prerelease leg (build_next.yml, DuckDB v2) actually build instead of
+          # silently skipping, so it must track the release SHA too.
+          sed -E "s|^([[:space:]]*ref(_next)?:).*|\1 $SHA|" "../source/description.yml" > "$target"
           grep -q "ref: $SHA" "$target"
+          grep -q "ref_next: $SHA" "$target" || {
+            echo "::error::description.yml has no ref_next; the upstream v2 prerelease build would skip"
+            exit 1
+          }
           grep -q "version: $VERSION" "$target" || {
             echo "::error::description.yml does not carry version $VERSION; check the x-release-please-version marker"
             exit 1

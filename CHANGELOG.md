@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.5](https://github.com/am2222/duck_geoarrow/compare/v0.1.4...v0.1.5) (2026-09-22)
+
+
+### Features
+
+* enhance GeoArrow function registration with detailed descriptions and examples ([334bfe0](https://github.com/am2222/duck_geoarrow/commit/334bfe0a94f7a4912fc88f13bbde6598c09a5af4))
+
+
+### Bug Fixes
+
+* **release:** update ref and ref_next in description.yml for prerelease ([511fae5](https://github.com/am2222/duck_geoarrow/commit/511fae5737adf3cba8c3e0eb52a9e09ab1decd66))
+
 ## [0.1.4](https://github.com/am2222/duck_geoarrow/compare/v0.1.3...v0.1.4) (2026-09-07)
 
 

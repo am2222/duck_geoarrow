@@ -1270,13 +1270,21 @@ static void DuckGeoarrowVersionFun(DataChunk &args, ExpressionState &state, Vect
 
 // --- Extension registration ---
 
-// The six GeoArrow geometry types, with the per-type function-name suffix and the bind
-// callback that pins the geometry type for the read direction.
+// The six GeoArrow geometry types, with the per-type function-name suffix, the bind
+// callback that pins the geometry type for the read direction, and the parts of the
+// duckdb_functions() documentation that differ per type.
 struct GeometryTypeEntry {
 	enum GeoArrowGeometryType geometry_type;
 	const char *suffix;
 	scalar_function_t write_fn;
 	bind_scalar_function_t read_bind;
+	//! The geometry type as it is spelled in prose and in WKT
+	const char *title;
+	//! An XY and an XYZ geometry of this type, for the write-direction examples
+	const char *example_wkt;
+	const char *example_wkt_z;
+	//! A native-encoded XY value of this type, for the read-direction example
+	const char *example_value;
 };
 
 // Every conversion function throws on malformed input, so each must be marked fallible;
@@ -1286,26 +1294,67 @@ static ScalarFunction Fallible(ScalarFunction function) {
 	return function;
 }
 
+// One entry of CreateFunctionInfo::descriptions, which is what fills the description,
+// examples and parameters columns of duckdb_functions().
+//
+// duckdb_functions() emits one row per overload and picks the description whose
+// parameter_types match that row. A lone description is used for every overload; once
+// there are several, matching is by arity and by exact type, with ANY standing in for any
+// one type. The sets below differ only in arity, so ANY is enough to tell them apart.
+// parameter_names are positional: an N-argument overload takes the first N of them.
+static FunctionDescription Describe(vector<LogicalType> parameter_types, vector<string> parameter_names,
+                                    string description, string example,
+                                    vector<string> categories = {"spatial", "conversion"}) {
+	FunctionDescription result;
+	result.parameter_types = std::move(parameter_types);
+	result.parameter_names = std::move(parameter_names);
+	result.description = std::move(description);
+	result.examples = {std::move(example)};
+	result.categories = std::move(categories);
+	return result;
+}
+
+// loader.RegisterFunction(ScalarFunction / ScalarFunctionSet) has nowhere to put a
+// FunctionDescription, so go through CreateScalarFunctionInfo instead. That overload is
+// also what sets ALTER_ON_CONFLICT internally; the CreateInfo default is
+// ERROR_ON_CONFLICT, so it has to be restated here.
+template <class FUNCTION>
+static void RegisterDocumented(ExtensionLoader &loader, FUNCTION function, vector<FunctionDescription> descriptions) {
+	CreateScalarFunctionInfo info(std::move(function));
+	info.descriptions = std::move(descriptions);
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	loader.RegisterFunction(std::move(info));
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	static const enum GeoArrowDimensions ALL_DIMS[] = {GEOARROW_DIMENSIONS_XY, GEOARROW_DIMENSIONS_XYZ,
 	                                                   GEOARROW_DIMENSIONS_XYM, GEOARROW_DIMENSIONS_XYZM};
 
 	const GeometryTypeEntry types[] = {
 	    {GEOARROW_GEOMETRY_TYPE_POINT, "point", StAsGeoArrowPointFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_POINT>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_POINT>), "Point", "POINT (30 10)", "POINT Z (0 0 1)",
+	     "{'x': 30.0, 'y': 10.0}"},
 	    {GEOARROW_GEOMETRY_TYPE_LINESTRING, "linestring", StAsGeoArrowLineStringFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_LINESTRING>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_LINESTRING>), "LineString", "LINESTRING (0 0, 4 0)",
+	     "LINESTRING Z (0 0 1, 4 0 2)", "[{'x': 0.0, 'y': 0.0}, {'x': 4.0, 'y': 0.0}]"},
 	    {GEOARROW_GEOMETRY_TYPE_POLYGON, "polygon", StAsGeoArrowPolygonFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_POLYGON>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_POLYGON>), "Polygon",
+	     "POLYGON ((0 0, 4 0, 4 4, 0 0))", "POLYGON Z ((0 0 1, 4 0 2, 4 4 3, 0 0 1))",
+	     "[[{'x': 0.0, 'y': 0.0}, {'x': 4.0, 'y': 0.0}, {'x': 4.0, 'y': 4.0}, {'x': 0.0, 'y': 0.0}]]"},
 	    {GEOARROW_GEOMETRY_TYPE_MULTIPOINT, "multipoint", StAsGeoArrowMultiPointFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOINT>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOINT>), "MultiPoint", "MULTIPOINT (0 0, 4 0)",
+	     "MULTIPOINT Z (0 0 1, 4 0 2)", "[{'x': 0.0, 'y': 0.0}, {'x': 4.0, 'y': 0.0}]"},
 	    {GEOARROW_GEOMETRY_TYPE_MULTILINESTRING, "multilinestring", StAsGeoArrowMultiLineStringFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTILINESTRING>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTILINESTRING>), "MultiLineString",
+	     "MULTILINESTRING ((0 0, 4 0), (4 4, 8 8))", "MULTILINESTRING Z ((0 0 1, 4 0 2), (4 4 3, 8 8 4))",
+	     "[[{'x': 0.0, 'y': 0.0}, {'x': 4.0, 'y': 0.0}], [{'x': 4.0, 'y': 4.0}, {'x': 8.0, 'y': 8.0}]]"},
 	    {GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON, "multipolygon", StAsGeoArrowMultiPolygonFun,
-	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON>)},
+	     DUCK_GEOARROW_BIND(NativeReadBind<GEOARROW_GEOMETRY_TYPE_MULTIPOLYGON>), "MultiPolygon",
+	     "MULTIPOLYGON (((0 0, 4 0, 4 4, 0 0)))", "MULTIPOLYGON Z (((0 0 1, 4 0 2, 4 4 3, 0 0 1)))",
+	     "[[[{'x': 0.0, 'y': 0.0}, {'x': 4.0, 'y': 0.0}, {'x': 4.0, 'y': 4.0}, {'x': 0.0, 'y': 0.0}]]]"},
 	};
 
-	// --- st_asgeoarrow(geom[, dimensions]) -> flat GeoArrow STRUCT ---
+	// --- st_asgeoarrow(geom[, dims]) -> flat GeoArrow STRUCT ---
 	// The return type is computed in the bind, so the one-argument form stays XY.
 	ScalarFunctionSet st_asgeoarrow_set("st_asgeoarrow");
 	const vector<LogicalType> wkb_inputs = {LogicalType::GEOMETRY(), LogicalType::BLOB};
@@ -1317,7 +1366,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    Fallible(ScalarFunction(vector<LogicalType> {input, LogicalType::VARCHAR}, GeoArrowStructType(),
 		                            StAsGeoArrowWKBFun, DUCK_GEOARROW_BIND(StAsGeoArrowBind))));
 	}
-	loader.RegisterFunction(st_asgeoarrow_set);
+	RegisterDocumented(
+	    loader, std::move(st_asgeoarrow_set),
+	    {Describe({LogicalType::ANY}, {"geom"},
+	              "Converts a GEOMETRY or WKB BLOB to the flat GeoArrow encoding: one STRUCT per geometry holding a "
+	              "geometry_type code alongside parallel coordinate (xs, ys) and offset (ring_offsets, geom_offsets) "
+	              "arrays, with XY coordinates.",
+	              "st_asgeoarrow('POINT(30 10)'::GEOMETRY)"),
+	     Describe({LogicalType::ANY, LogicalType::VARCHAR}, {"geom", "dims"},
+	              "Converts a GEOMETRY or WKB BLOB to the flat GeoArrow encoding, writing the ordinates named by dims "
+	              "('xy', 'xyz', 'xym' or 'xyzm'); dropping ordinates the geometry carries is allowed, asking for "
+	              "ones it does not have is an error.",
+	              "st_asgeoarrow('LINESTRING ZM (0 0 1 5, 1 1 2 6)'::GEOMETRY, 'xyzm')")});
 
 	// --- st_geomfromgeoarrow(...) -> GEOMETRY ---
 	// Three shapes share one name:
@@ -1339,9 +1399,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 			native = LogicalType::LIST(native);
 		}
 	}
-	loader.RegisterFunction(st_geomfromgeoarrow_set);
+	RegisterDocumented(
+	    loader, std::move(st_geomfromgeoarrow_set),
+	    {Describe({LogicalType::ANY}, {"geom"},
+	              "Converts a flat GeoArrow struct back into a GEOMETRY; fields are matched by name, so their order "
+	              "in the struct does not matter, and the zs / ms lists are read when present.",
+	              "st_geomfromgeoarrow({'geometry_type': 2::UTINYINT, 'xs': [0.0, 1.0, 2.0], 'ys': [0.0, 1.0, 2.0], "
+	              "'ring_offsets': []::INTEGER[], 'geom_offsets': []::INTEGER[]})"),
+	     Describe({LogicalType::VARCHAR, LogicalType::ANY}, {"geometry_type", "value"},
+	              "Converts any GeoArrow native encoding into a GEOMETRY, with geometry_type naming the type as a "
+	              "constant string ('point', 'linestring', 'polygon', 'multipoint', 'multilinestring' or "
+	              "'multipolygon', optionally with a z, m or zm suffix); the name is required because LineString and "
+	              "MultiPoint, and Polygon and MultiLineString, share one DuckDB type.",
+	              "st_geomfromgeoarrow('linestring', [{'x': 0.0, 'y': 0.0}, {'x': 1.0, 'y': 1.0}])")});
 
-	// --- st_asgeoarrow<type>(geom[, dimensions]) and st_geomfromgeoarrow<type>(value) ---
+	// --- st_asgeoarrow<type>(geom[, dims]) and st_geomfromgeoarrow<type>(value) ---
 	// GeoArrow native encodings, separated coordinates per the spec:
 	//   Point           → STRUCT(x, y)
 	//   LineString      → LIST(STRUCT(x, y))
@@ -1351,7 +1423,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//   MultiPolygon    → LIST(LIST(LIST(STRUCT(x, y))))
 	// with z / m ordinates added to the coordinate struct for the other dimensions.
 	for (auto &entry : types) {
-		ScalarFunctionSet write_set(FunctionSetName(string("st_asgeoarrow") + entry.suffix));
+		const string xy_type = NativeType(entry.geometry_type, GEOARROW_DIMENSIONS_XY).ToString();
+		const string write_name = string("st_asgeoarrow") + entry.suffix;
+		const string read_name = string("st_geomfromgeoarrow") + entry.suffix;
+
+		ScalarFunctionSet write_set {FunctionSetName(write_name)};
 		for (auto &input : wkb_inputs) {
 			auto xy_out = NativeType(entry.geometry_type, GEOARROW_DIMENSIONS_XY);
 			write_set.AddFunction(Fallible(ScalarFunction(vector<LogicalType> {input}, xy_out, entry.write_fn,
@@ -1359,20 +1435,41 @@ static void LoadInternal(ExtensionLoader &loader) {
 			write_set.AddFunction(Fallible(ScalarFunction(vector<LogicalType> {input, LogicalType::VARCHAR}, xy_out,
 			                                              entry.write_fn, DUCK_GEOARROW_BIND(StAsGeoArrowNativeBind))));
 		}
-		loader.RegisterFunction(write_set);
+		RegisterDocumented(
+		    loader, std::move(write_set),
+		    {Describe({LogicalType::ANY}, {"geom"},
+		              "Converts a " + string(entry.title) +
+		                  " GEOMETRY or WKB BLOB into the GeoArrow native encoding for that geometry type (" + xy_type +
+		                  "), erroring if the input is not a " + entry.title + ".",
+		              write_name + "('" + entry.example_wkt + "'::GEOMETRY)"),
+		     Describe({LogicalType::ANY, LogicalType::VARCHAR}, {"geom", "dims"},
+		              "Converts a " + string(entry.title) +
+		                  " GEOMETRY or WKB BLOB into the GeoArrow native encoding for that geometry type, writing "
+		                  "the ordinates named by dims ('xy', 'xyz', 'xym' or 'xyzm').",
+		              write_name + "('" + entry.example_wkt_z + "'::GEOMETRY, 'xyz')")});
 
-		ScalarFunctionSet read_set(FunctionSetName(string("st_geomfromgeoarrow") + entry.suffix));
+		ScalarFunctionSet read_set {FunctionSetName(read_name)};
 		for (auto dims : ALL_DIMS) {
 			read_set.AddFunction(
 			    Fallible(ScalarFunction(vector<LogicalType> {NativeType(entry.geometry_type, dims)},
 			                            LogicalType::GEOMETRY(), StGeomFromNativeFun, entry.read_bind)));
 		}
-		loader.RegisterFunction(read_set);
+		RegisterDocumented(loader, std::move(read_set),
+		                   {Describe({}, {"value"},
+		                             "Converts a GeoArrow native " + string(entry.title) + " encoding (" + xy_type +
+		                                 ", or its XYZ / XYM / XYZM equivalent) into a " + entry.title +
+		                                 " GEOMETRY; the value's own type says which ordinates are present, so no "
+		                                 "dimensions argument is needed.",
+		                             read_name + "(" + entry.example_value + ")")});
 	}
 
 	// duck_geoarrow_version: returns version info
 	auto version_func = ScalarFunction("duck_geoarrow_version", {}, LogicalType::VARCHAR, DuckGeoarrowVersionFun);
-	loader.RegisterFunction(version_func);
+	RegisterDocumented(loader, std::move(version_func),
+	                   {Describe({}, {},
+	                             "Returns the version of the duck_geoarrow extension together with the version of "
+	                             "the bundled geoarrow-c library.",
+	                             "duck_geoarrow_version()", {"metadata"})});
 }
 
 void DuckGeoarrowExtension::Load(ExtensionLoader &loader) {

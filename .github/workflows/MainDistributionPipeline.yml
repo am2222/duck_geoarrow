@@ -14,33 +14,20 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0.0
+      ci_tools_version: main
       extension_name: duck_geoarrow
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
-      extension_name: duck_geoarrow
-      format_checks: 'format;tidy'
-
-  # Canary build against the upcoming DuckDB v2. community-extensions builds every
-  # extension against this same branch (see its build_next.yml), so a failure here is
-  # one that would show up there. Artifacts get a postfix so the release job below can
-  # tell them apart from the v1.5.5 binaries and leave them out of the GitHub release.
-  duckdb-next-build:
-    name: Build extension binaries (DuckDB v2 canary)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
-    with:
-      duckdb_version: v2.0-cyanoptera
+      duckdb_version: v2.0.0
       ci_tools_version: main
       extension_name: duck_geoarrow
-      artifact_postfix: -duckdb-next
+      format_checks: 'format;tidy'
 
   release:
     name: Publish release
@@ -56,15 +43,13 @@ jobs:
         with:
           path: raw-artifacts
 
-      # Each artifact dir is named  duck_geoarrow-v1.5.5-extension-<platform>
+      # Each artifact dir is named  duck_geoarrow-v2.0.0-extension-<platform>
       # and contains  build/release/extension/duck_geoarrow/duck_geoarrow.duckdb_extension
       # Flatten & rename to  duck_geoarrow-<platform>.duckdb_extension for the release.
-      # The v2 canary's artifacts end in -duckdb-next and are not released.
       - name: Collect and rename extension binaries
         run: |
           mkdir -p dist
           for artifact_dir in raw-artifacts/duck_geoarrow-*-extension-*/; do
-            case "$artifact_dir" in *-duckdb-next/) continue ;; esac
             platform=$(basename "$artifact_dir" | sed 's/duck_geoarrow-[^-]*-extension-//')
             src=$(find "$artifact_dir" -name "duck_geoarrow.duckdb_extension" | head -1)
             if [ -n "$src" ]; then
@@ -81,7 +66,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "Release ${{ github.ref_name }}"
           body: |
-            Release **${{ github.ref_name }}** built against **DuckDB v1.5.5**.
+            Release **${{ github.ref_name }}** built against **DuckDB v2.0.0**.
 
             ## Download
 

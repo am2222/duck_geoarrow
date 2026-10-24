@@ -12,9 +12,8 @@ set(GEOARROW_USE_FAST_FLOAT_DEFINE "#define GEOARROW_USE_FAST_FLOAT 0")
 set(GEOARROW_USE_RYU_DEFINE "#define GEOARROW_USE_RYU 1")
 set(GEOARROW_NAMESPACE_DEFINE "// #define GEOARROW_NAMESPACE YourNamespaceHere")
 configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/geoarrow-c/src/geoarrow/geoarrow_config.h.in
-    ${CMAKE_CURRENT_BINARY_DIR}/generated/geoarrow/geoarrow_config.h
-)
+  ${CMAKE_CURRENT_SOURCE_DIR}/third-party/geoarrow-c/src/geoarrow/geoarrow_config.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/geoarrow/geoarrow_config.h)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -23,7 +22,8 @@ project(${TARGET_NAME})
 
 include_directories(src/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third-party/geoarrow-c/src)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third-party/geoarrow-c/src/vendor)
+include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/third-party/geoarrow-c/src/vendor)
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 set(GEOARROW_C_SOURCES
@@ -47,8 +47,7 @@ set(GEOARROW_C_SOURCES
     third-party/geoarrow-c/src/geoarrow/double_parse_std.c
     third-party/geoarrow-c/src/geoarrow/double_print.c
     third-party/geoarrow-c/src/geoarrow/ryu/d2s.c
-    third-party/geoarrow-c/src/vendor/nanoarrow/nanoarrow.c
-)
+    third-party/geoarrow-c/src/vendor/nanoarrow/nanoarrow.c)
 
 set(EXTENSION_SOURCES src/duck_geoarrow_extension.cpp ${GEOARROW_C_SOURCES})
 

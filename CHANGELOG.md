@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/am2222/duck_geoarrow/compare/v0.1.5...v0.2.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* DuckDB v1.5.x is no longer supported; the v1.5 compatibility layer was removed.
+
+### Features
+
+* require DuckDB v2.0.0 ([a1ad115](https://github.com/am2222/duck_geoarrow/commit/a1ad1151a8c5ca4c71e2164a84daa7935b5707de))
+
 ## [0.1.5](https://github.com/am2222/duck_geoarrow/compare/v0.1.4...v0.1.5) (2026-09-22)
 
 
